@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
+use crate::buckets::bucket_for_snapshot;
 use crate::config::Config;
 use crate::types::{now_us, Bps, Bucket, MarketDef, MarketSnapshot, Signal, SignalLeg};
 
@@ -110,33 +111,17 @@ fn eval_snapshot(
         n => anyhow::bail!("unsupported legs: {n}"),
     };
 
-    let mut sum_ask = 0.0f64;
-    let mut worst_depth = f64::INFINITY;
-    let mut worst_spread_bps = f64::INFINITY;
+    let bucket = bucket_for_snapshot(snap);
 
-    for leg in &snap.legs {
-        sum_ask += leg.best_ask;
-
-        let mid = (leg.best_ask + leg.best_bid) / 2.0;
-        if mid <= 0.0 {
-            continue;
-        }
-        let spread_bps = ((leg.best_ask - leg.best_bid) / mid) * 10_000.0;
-
-        if leg.ask_depth3_usdc < worst_depth {
-            worst_depth = leg.ask_depth3_usdc;
-            worst_spread_bps = spread_bps;
-        }
+    let sum_ask: f64 = snap.legs.iter().map(|l| l.best_ask).sum();
+    // Common case: `sum(best_ask_i) >= 1.0` just means "no arb" — never panic / crash the brain.
+    // Treat it as a non-signal path (net edge forced negative) so the caller filters it out.
+    if sum_ask >= 1.0 {
+        return Ok((strategy, bucket, Bps::new(-10_000)));
     }
 
-    let bucket = if worst_spread_bps < 20.0 && worst_depth > 500.0 {
-        Bucket::Liquid
-    } else {
-        Bucket::Thin
-    };
-
-    let raw_cost_bps = (sum_ask * 10_000.0).floor() as i32;
-    let raw_edge = Bps::ONE_HUNDRED_PERCENT - Bps::new(raw_cost_bps);
+    let raw_cost_bps = Bps::from_price_cost(sum_ask);
+    let raw_edge = Bps::ONE_HUNDRED_PERCENT - raw_cost_bps;
 
     let hard_fees = Bps::FEE_POLY + Bps::FEE_MERGE;
     let risk_premium = Bps::new(cfg.brain.risk_premium_bps);
@@ -196,5 +181,48 @@ mod tests {
         assert_eq!(bucket, Bucket::Liquid);
         // sum ask = 0.90 => raw_edge = 1000 bps; net = 1000 - 210 - 80 = 710
         assert_eq!(net_edge.raw(), 710);
+    }
+
+    #[test]
+    fn sum_asks_ge_one_is_non_signal_path() {
+        let cfg = Config {
+            polymarket: PolymarketConfig::default(),
+            run: RunConfig {
+                data_dir: "data".into(),
+                market_ids: vec![],
+            },
+            brain: BrainConfig {
+                risk_premium_bps: 80,
+                min_net_edge_bps: 10,
+                q_req: 10.0,
+                signal_cooldown_ms: 0,
+            },
+            buckets: BucketConfig::default(),
+            shadow: ShadowConfig::default(),
+        };
+
+        let snap = MarketSnapshot {
+            market_id: "m".to_string(),
+            legs: vec![
+                LegSnapshot {
+                    token_id: "a".to_string(),
+                    best_ask: 0.6,
+                    best_bid: 0.5992,
+                    ask_depth3_usdc: 1_000.0,
+                    ts_recv_us: 0,
+                },
+                LegSnapshot {
+                    token_id: "b".to_string(),
+                    best_ask: 0.6,
+                    best_bid: 0.5992,
+                    ask_depth3_usdc: 1_000.0,
+                    ts_recv_us: 0,
+                },
+            ],
+        };
+
+        let (_, bucket, net_edge) = eval_snapshot(&cfg, &snap).expect("eval");
+        assert_eq!(bucket, Bucket::Liquid);
+        assert!(net_edge <= Bps::ZERO);
     }
 }

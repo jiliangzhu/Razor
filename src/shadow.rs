@@ -4,13 +4,15 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::buckets::fill_share_p25;
 use crate::config::Config;
 use crate::recorder::{CsvAppender, SHADOW_HEADER};
-use crate::types::{now_us, Bps, Bucket, MarketDef, Signal, TradeTick};
+use crate::types::{now_us, Bps, MarketDef, Signal, TradeTick};
 
 const LEFTOVER_DUMP_MULT: f64 = 0.95;
+const SUSPICIOUS_TRADE_SIZE: f64 = 1_000.0;
 
 pub async fn run(
     cfg: Config,
@@ -88,16 +90,15 @@ fn settle_one(
     let start_us = s.ts_signal_us + window_start_us;
     let end_us = s.ts_signal_us + window_end_us;
 
-    let fill_share_used = match s.bucket {
-        Bucket::Liquid => cfg.buckets.fill_share_liquid_p25,
-        Bucket::Thin => cfg.buckets.fill_share_thin_p25,
-    };
+    let fill_share_used = fill_share_p25(s.bucket, &cfg.buckets);
 
     let mut v_mkt: Vec<f64> = Vec::with_capacity(s.legs.len());
     let mut q_fill: Vec<f64> = Vec::with_capacity(s.legs.len());
 
     for leg in &s.legs {
         let mut v = 0.0f64;
+        let mut max_trade_size = 0.0f64;
+        let mut saw_suspicious_size = false;
         if let Some(q) = trades_by_token.get(&leg.token_id) {
             for t in q {
                 if t.market_id != s.market_id {
@@ -106,10 +107,25 @@ fn settle_one(
                 if t.ts_recv_us < start_us || t.ts_recv_us > end_us {
                     continue;
                 }
+                if t.size.is_finite() {
+                    max_trade_size = max_trade_size.max(t.size);
+                    if t.size >= SUSPICIOUS_TRADE_SIZE {
+                        saw_suspicious_size = true;
+                    }
+                }
                 if t.price <= leg.p_limit {
                     v += t.size;
                 }
             }
+        }
+        if saw_suspicious_size {
+            warn!(
+                signal_id = s.signal_id,
+                market_id = %s.market_id,
+                token_id = %leg.token_id,
+                max_trade_size,
+                "suspicious trade.size observed (verify whether Data API size is shares vs notional)"
+            );
         }
         v_mkt.push(v);
 
@@ -215,7 +231,8 @@ mod tests {
         BrainConfig, BucketConfig, Config, PolymarketConfig, RunConfig, ShadowConfig,
     };
     use crate::recorder::CsvAppender;
-    use crate::types::{Bps, SignalLeg, Strategy};
+    use crate::types::{Bps, Bucket, SignalLeg, Strategy};
+    use assert_approx_eq::assert_approx_eq;
 
     #[test]
     fn settles_binary_signal_with_leftover_penalty() {
@@ -297,14 +314,32 @@ mod tests {
         assert_eq!(cols.len(), SHADOW_HEADER.len());
 
         let q_set: f64 = cols[24].parse().expect("q_set");
+        let q_left1: f64 = cols[25].parse().expect("q_left1");
+        let q_left2: f64 = cols[26].parse().expect("q_left2");
         let set_ratio: f64 = cols[28].parse().expect("set_ratio");
+        let pnl_set: f64 = cols[29].parse().expect("pnl_set");
+        let pnl_left: f64 = cols[30].parse().expect("pnl_left");
         let pnl_total: f64 = cols[31].parse().expect("pnl_total");
 
         // q_fill: A=10, B=6 => q_set=6, set_ratio=0.6
-        assert!((q_set - 6.0).abs() < 1e-9);
-        assert!((set_ratio - 0.6).abs() < 1e-9);
+        assert_approx_eq!(q_set, 6.0, 1e-9);
+        assert_approx_eq!(q_left1, 4.0, 1e-9);
+        assert_approx_eq!(q_left2, 0.0, 1e-9);
+        assert_approx_eq!(set_ratio, 0.6, 1e-9);
 
-        // pnl_total should be negative with leftover dump penalty.
-        assert!(pnl_total < 0.0);
+        let cost_per_set = Bps::FEE_POLY.apply_cost(0.49) + Bps::FEE_POLY.apply_cost(0.48);
+        let proceeds_per_set = Bps::FEE_MERGE.apply_proceeds(1.0);
+        let expected_pnl_set = (6.0 * proceeds_per_set) - (6.0 * cost_per_set);
+
+        let exit_a = 0.48 * LEFTOVER_DUMP_MULT;
+        let expected_left_cost_a = 4.0 * Bps::FEE_POLY.apply_cost(0.49);
+        let expected_left_proceeds_a = 4.0 * Bps::FEE_POLY.apply_proceeds(exit_a);
+        let expected_pnl_left = expected_left_proceeds_a - expected_left_cost_a;
+
+        let expected_total = expected_pnl_set + expected_pnl_left;
+
+        assert_approx_eq!(pnl_set, expected_pnl_set, 1e-9);
+        assert_approx_eq!(pnl_left, expected_pnl_left, 1e-9);
+        assert_approx_eq!(pnl_total, expected_total, 1e-9);
     }
 }

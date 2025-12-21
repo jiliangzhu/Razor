@@ -1,9 +1,17 @@
+//! Unit system (frozen):
+//! - All **fees / edges / thresholds / budgets** are expressed in **basis points** (`Bps`).
+//! - Only at the final step (multiplying a fee into a `price`) do we convert to `f64`.
+//! - Converting ratios to `Bps` must be **directional**:
+//!   - For **cost / gating** (avoid false-positive edge): use `from_cost_ratio` (ceil).
+//!   - For **proceeds / display**: use `from_proceeds_ratio` (floor).
+//! - Do **not** introduce float fee constants like `0.02` outside this module.
+
 use std::fmt;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Bps(i32);
+pub struct Bps(pub i32);
 
 impl Bps {
     #[allow(dead_code)]
@@ -11,6 +19,8 @@ impl Bps {
     pub const ONE_HUNDRED_PERCENT: Bps = Bps(10_000);
     pub const FEE_POLY: Bps = Bps(200);
     pub const FEE_MERGE: Bps = Bps(10);
+    pub const BASIS: f64 = 10_000.0;
+    const FROM_RATIO_EPS: f64 = 1e-9;
 
     pub const fn new(raw: i32) -> Self {
         Self(raw)
@@ -20,14 +30,108 @@ impl Bps {
         self.0
     }
 
-    pub fn apply_cost(self, amount: f64) -> f64 {
-        let scalar = 1.0 + (self.0 as f64) / (Self::ONE_HUNDRED_PERCENT.0 as f64);
-        amount * scalar
+    pub fn to_f64(self) -> f64 {
+        (self.0 as f64) / Self::BASIS
     }
 
-    pub fn apply_proceeds(self, amount: f64) -> f64 {
-        let scalar = 1.0 - (self.0 as f64) / (Self::ONE_HUNDRED_PERCENT.0 as f64);
-        amount * scalar
+    /// Convert a ratio-like value into basis points using **floor** (e.g. `0.985 -> 9850`).
+    ///
+    /// Rounding strategy: **floor** after scaling by `BASIS`.
+    /// We add a tiny epsilon to avoid cases like `0.1 * 10000` becoming `999.999...`.
+    #[allow(dead_code)]
+    pub fn from_ratio_floor(x: f64) -> Bps {
+        assert!(x.is_finite(), "ratio must be finite");
+        assert!(x >= 0.0, "ratio must be >= 0");
+
+        let scaled = (x * Self::BASIS) + Self::FROM_RATIO_EPS;
+        let raw = scaled.floor() as i64;
+        assert!(
+            raw >= i32::MIN as i64 && raw <= i32::MAX as i64,
+            "Bps::from_ratio_floor overflow"
+        );
+        Bps(raw as i32)
+    }
+
+    /// Convert a ratio-like value into basis points using **ceil** (e.g. `0.98509 -> 9851`).
+    ///
+    /// This is the correct direction for **cost / gating**: it avoids systematically
+    /// under-estimating costs which would inflate computed edge.
+    ///
+    /// We subtract a tiny epsilon to avoid cases like `1.0 * 10000` becoming `10000.0000...2`
+    /// and rounding up to 10001.
+    #[allow(dead_code)]
+    pub fn from_ratio_ceil(x: f64) -> Bps {
+        assert!(x.is_finite(), "ratio must be finite");
+        assert!(x >= 0.0, "ratio must be >= 0");
+
+        let scaled = (x * Self::BASIS) - Self::FROM_RATIO_EPS;
+        let raw = scaled.ceil() as i64;
+        assert!(
+            raw >= i32::MIN as i64 && raw <= i32::MAX as i64,
+            "Bps::from_ratio_ceil overflow"
+        );
+        Bps(raw as i32)
+    }
+
+    /// Alias for **cost / gating** conversion (ceil).
+    #[allow(dead_code)]
+    pub fn from_cost_ratio(x: f64) -> Bps {
+        Self::from_ratio_ceil(x)
+    }
+
+    /// Alias for **proceeds / display** conversion (floor).
+    #[allow(dead_code)]
+    pub fn from_proceeds_ratio(x: f64) -> Bps {
+        Self::from_ratio_floor(x)
+    }
+
+    /// Convert a probability-style price `p` in `[0, 1]` into basis points.
+    ///
+    /// Use this when you want strict probability-domain validation.
+    #[allow(dead_code)]
+    pub fn from_prob(p: f64) -> Bps {
+        assert!(p.is_finite(), "price must be finite");
+        assert!(p >= 0.0, "price must be >= 0");
+        assert!(p <= 1.0, "price must be <= 1");
+        Self::from_proceeds_ratio(p)
+    }
+
+    /// Convert a price/ratio to basis points.
+    ///
+    /// Note: this function intentionally allows values > 1.0 (e.g. multi-leg sums like
+    /// `sum(best_ask_i)`), but it uses **floor** and therefore must not be used for
+    /// cost/gating. Use `from_cost_ratio` for that.
+    #[allow(dead_code)]
+    pub fn from_price(p: f64) -> Bps {
+        Self::from_proceeds_ratio(p)
+    }
+
+    /// Convert a price/ratio to basis points for **cost / gating** (ceil).
+    ///
+    /// This is the safe default when the result will be subtracted from 10_000 to compute edge.
+    #[allow(dead_code)]
+    pub fn from_price_cost(p: f64) -> Bps {
+        if !p.is_finite() || p < 0.0 {
+            return Bps::ONE_HUNDRED_PERCENT;
+        }
+        Self::from_cost_ratio(p)
+    }
+
+    /// Convert a price/ratio to basis points for **proceeds / display** (floor).
+    #[allow(dead_code)]
+    pub fn from_price_proceeds(p: f64) -> Bps {
+        if !p.is_finite() || p < 0.0 {
+            return Bps::ZERO;
+        }
+        Self::from_proceeds_ratio(p)
+    }
+
+    pub fn apply_cost(self, price: f64) -> f64 {
+        price * (1.0 + self.to_f64())
+    }
+
+    pub fn apply_proceeds(self, price: f64) -> f64 {
+        price * (1.0 - self.to_f64())
     }
 
     #[allow(dead_code)]
@@ -46,7 +150,7 @@ impl Add for Bps {
     type Output = Bps;
 
     fn add(self, rhs: Bps) -> Self::Output {
-        Bps(self.0 + rhs.0)
+        Bps(self.0.checked_add(rhs.0).expect("Bps add overflow"))
     }
 }
 
@@ -54,19 +158,19 @@ impl Sub for Bps {
     type Output = Bps;
 
     fn sub(self, rhs: Bps) -> Self::Output {
-        Bps(self.0 - rhs.0)
+        Bps(self.0.checked_sub(rhs.0).expect("Bps sub overflow"))
     }
 }
 
 impl AddAssign for Bps {
     fn add_assign(&mut self, rhs: Bps) {
-        self.0 += rhs.0;
+        self.0 = self.0.checked_add(rhs.0).expect("Bps add_assign overflow");
     }
 }
 
 impl SubAssign for Bps {
     fn sub_assign(&mut self, rhs: Bps) {
-        self.0 -= rhs.0;
+        self.0 = self.0.checked_sub(rhs.0).expect("Bps sub_assign overflow");
     }
 }
 
@@ -175,16 +279,80 @@ mod tests {
 
     #[test]
     fn bps_apply_cost_and_proceeds() {
-        let fee = Bps::new(200); // 2%
-        assert_approx_eq!(fee.apply_cost(1.0), 1.02);
-        assert_approx_eq!(fee.apply_proceeds(1.0), 0.98);
+        let fee = Bps::FEE_POLY; // 2%
+        let expected_delta = (fee.raw() as f64) / Bps::BASIS;
+        assert_approx_eq!(fee.apply_cost(1.0), 1.0 + expected_delta);
+        assert_approx_eq!(fee.apply_proceeds(1.0), 1.0 - expected_delta);
     }
 
     #[test]
     fn bps_add_sub() {
-        let a = Bps::new(10);
-        let b = Bps::new(5);
-        assert_eq!((a + b).raw(), 15);
-        assert_eq!((a - b).raw(), 5);
+        assert_eq!((Bps::FEE_POLY + Bps::FEE_MERGE).raw(), 210);
+        assert_eq!(
+            (Bps::ONE_HUNDRED_PERCENT - Bps::from_price(0.985)).raw(),
+            150
+        );
+    }
+
+    #[test]
+    fn from_price_units() {
+        assert_eq!(Bps::from_price(0.1).raw(), 1000);
+        assert_eq!(Bps::from_price(1.0).raw(), 10_000);
+        assert_eq!(Bps::from_price(0.985).raw(), 9850);
+    }
+
+    #[test]
+    fn from_ratio_allows_gt_one() {
+        let sum_prices = 1.23456; // scaled=12345.6
+        assert_eq!(Bps::from_proceeds_ratio(sum_prices).raw(), 12_345);
+        assert_eq!(Bps::from_cost_ratio(sum_prices).raw(), 12_346);
+        assert_eq!(Bps::from_price(sum_prices).raw(), 12_345);
+    }
+
+    #[test]
+    #[should_panic(expected = "price must be <= 1")]
+    fn from_prob_rejects_gt_one() {
+        let _ = Bps::from_prob(1.0001);
+    }
+
+    #[test]
+    fn edge_example_uses_bps_domain() {
+        // Example: sum_prices = 0.985 => raw_cost_bps = 9850 => raw_edge_bps = 150
+        let sum_prices = 0.985;
+        let raw_cost_bps = Bps::from_price(sum_prices);
+        let raw_edge_bps = Bps::ONE_HUNDRED_PERCENT - raw_cost_bps;
+        assert_eq!(raw_edge_bps.raw(), 150);
+    }
+
+    #[test]
+    fn cost_rounding_is_not_optimistic() {
+        // scaled = 9850.9: floor would under-estimate cost and inflate edge by 0.9 bps.
+        let sum_prices = 0.98509;
+        let cost_floor = Bps::from_proceeds_ratio(sum_prices);
+        let cost_ceil = Bps::from_cost_ratio(sum_prices);
+        assert_eq!(cost_floor.raw(), 9850);
+        assert_eq!(cost_ceil.raw(), 9851);
+
+        let edge_floor = Bps::ONE_HUNDRED_PERCENT - cost_floor;
+        let edge_ceil = Bps::ONE_HUNDRED_PERCENT - cost_ceil;
+        assert_eq!(edge_floor.raw(), 150);
+        assert_eq!(edge_ceil.raw(), 149);
+        assert!(edge_ceil <= edge_floor);
+    }
+
+    #[test]
+    fn from_price_cost_rounds_up_near_one() {
+        // scaled = 9999.1 => ceil => 10000 (must not be 9999).
+        assert_eq!(Bps::from_price_cost(0.99991).raw(), 10_000);
+        assert_eq!(Bps::from_price_proceeds(0.99991).raw(), 9_999);
+    }
+
+    #[test]
+    fn constants_are_exact() {
+        assert_eq!(Bps::ZERO.raw(), 0);
+        assert_eq!(Bps::ONE_HUNDRED_PERCENT.raw(), 10_000);
+        assert_eq!(Bps::FEE_POLY.raw(), 200);
+        assert_eq!(Bps::FEE_MERGE.raw(), 10);
+        assert_approx_eq!(Bps::BASIS, 10_000.0);
     }
 }
