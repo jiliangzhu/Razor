@@ -1,0 +1,27 @@
+[polymarket]
+gamma_base = "https://gamma-api.polymarket.com"
+ws_base = "wss://ws-subscriptions-clob.polymarket.com"
+data_api_base = "https://data-api.polymarket.com"
+
+[run]
+data_dir = "data"
+# Gamma market IDs (supports 2-leg binary or 3-leg triangle only)
+market_ids = ["516861"]
+
+[brain]
+risk_premium_bps = 80
+min_net_edge_bps = 10
+q_req = 10.0
+signal_cooldown_ms = 1000
+
+[buckets]
+fill_share_liquid_p25 = 0.30
+fill_share_thin_p25 = 0.10
+
+[shadow]
+window_start_ms = 100
+window_end_ms = 1100
+trade_poll_interval_ms = 1000
+trade_poll_limit = 500
+trade_retention_ms = 5000
+

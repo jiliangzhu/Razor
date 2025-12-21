@@ -1,0 +1,1 @@
+以 docs/architecture.md 为唯一真相；任何口径变更必须升版本号并在 PR 描述中写清楚。

@@ -1,0 +1,6 @@
+target/
+data/
+config.toml
+*.log
+.DS_Store
+
