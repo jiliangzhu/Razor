@@ -4,6 +4,7 @@ mod config;
 mod feed;
 mod recorder;
 mod shadow;
+mod trade_store;
 mod types;
 
 use anyhow::{anyhow, Context as _};

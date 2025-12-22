@@ -15,6 +15,9 @@ RAZOR_MODE=dry_run cargo run --release -- --config config.toml
 - `data/shadow_log.csv`
 - `data/raw_ws.jsonl`（可选：原始 WS 录制，用于复核/回放）
 
+`data/trades.csv` schema（v1.3.2-b 起）：
+- header：`ts_ms,market_id,token_id,price,size`（如已有旧版 `ts_recv_us`，请删除旧文件再跑）
+
 ## Smoke check
 
 1) 运行 60s：`RAZOR_MODE=dry_run cargo run --release -- --config config.toml`
@@ -25,4 +28,3 @@ RAZOR_MODE=dry_run cargo run --release -- --config config.toml
 ```bash
 python3 scripts/day14_report.py data/shadow_log.csv
 ```
-

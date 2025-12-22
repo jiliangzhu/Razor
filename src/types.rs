@@ -204,6 +204,21 @@ impl Bucket {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BucketMode {
+    FullL2,
+    ApproxDepth1,
+}
+
+impl BucketMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BucketMode::FullL2 => "full_l2",
+            BucketMode::ApproxDepth1 => "approx_depth1",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LegSnapshot {
     pub token_id: String,
@@ -231,17 +246,24 @@ pub struct SignalLeg {
 pub struct Signal {
     pub signal_id: u64,
     pub ts_signal_us: u64,
+    pub ts_ms: u64,
+    pub ts_snapshot_us: u64,
     pub market_id: String,
     pub strategy: Strategy,
     pub bucket: Bucket,
+    pub bucket_mode: BucketMode,
     pub q_req: f64,
+    pub raw_cost_bps: Bps,
+    pub raw_edge_bps: Bps,
+    pub hard_fees_bps: Bps,
+    pub risk_premium_bps: Bps,
     pub expected_net_bps: Bps,
     pub legs: Vec<SignalLeg>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeTick {
-    pub ts_recv_us: u64,
+    pub ts_ms: u64,
     pub market_id: String,
     pub token_id: String,
     pub price: f64,
@@ -269,6 +291,13 @@ pub fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     d.as_micros() as u64
+}
+
+pub fn now_ms() -> u64 {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    d.as_millis() as u64
 }
 
 #[cfg(test)]

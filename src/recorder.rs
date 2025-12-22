@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
-pub const TRADES_HEADER: [&str; 5] = ["ts_recv_us", "market_id", "token_id", "price", "size"];
+pub const TRADES_HEADER: [&str; 5] = ["ts_ms", "market_id", "token_id", "price", "size"];
 
 pub const TICKS_HEADER: [&str; 6] = [
     "ts_recv_us",

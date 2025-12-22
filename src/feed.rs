@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::recorder::{CsvAppender, JsonlAppender, TICKS_HEADER, TRADES_HEADER};
-use crate::types::{now_us, LegSnapshot, MarketDef, MarketSnapshot, TradeTick};
+use crate::types::{now_ms, now_us, LegSnapshot, MarketDef, MarketSnapshot, TradeTick};
 
 #[derive(Debug, Deserialize)]
 struct GammaMarket {
@@ -23,7 +23,7 @@ struct GammaMarket {
 
 pub async fn fetch_markets(cfg: &Config) -> anyhow::Result<Vec<MarketDef>> {
     let client = reqwest::Client::builder()
-        .user_agent("razor/1.3.2a")
+        .user_agent(concat!("razor/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build http client")?;
 
@@ -427,11 +427,20 @@ pub async fn run_trades_poller(
     let mut trades = CsvAppender::open(trades_path, &TRADES_HEADER).context("open trades.csv")?;
 
     let client = reqwest::Client::builder()
-        .user_agent("razor/1.3.2a")
+        .user_agent(concat!("razor/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build http client")?;
 
-    let market_ids: Vec<String> = markets.into_iter().map(|m| m.market_id).collect();
+    let mut allowed_tokens: HashSet<String> = HashSet::new();
+    let market_ids: Vec<String> = markets
+        .into_iter()
+        .inspect(|m| {
+            for t in &m.token_ids {
+                allowed_tokens.insert(t.clone());
+            }
+        })
+        .map(|m| m.market_id)
+        .collect();
     let market_param = market_ids.join(",");
 
     let url = format!(
@@ -495,9 +504,25 @@ pub async fn run_trades_poller(
                 continue;
             }
 
-            let ts_recv_us = now_us();
+            if t.asset_id.trim().is_empty() {
+                warn!(
+                    market_id = %t.market_id,
+                    "data-api trade missing token_id/asset; skipping tick to avoid shadow pollution"
+                );
+                continue;
+            }
+            if !allowed_tokens.contains(&t.asset_id) {
+                warn!(
+                    market_id = %t.market_id,
+                    token_id = %t.asset_id,
+                    "data-api trade token_id not in configured market token set; skipping"
+                );
+                continue;
+            }
+
+            let ts_ms = now_ms();
             let tick = TradeTick {
-                ts_recv_us,
+                ts_ms,
                 market_id: t.market_id.clone(),
                 token_id: t.asset_id.clone(),
                 price: t.price,
@@ -505,7 +530,7 @@ pub async fn run_trades_poller(
             };
 
             trades.write_record([
-                tick.ts_recv_us.to_string(),
+                tick.ts_ms.to_string(),
                 tick.market_id.clone(),
                 tick.token_id.clone(),
                 tick.price.to_string(),

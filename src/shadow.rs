@@ -1,18 +1,17 @@
-use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::buckets::fill_share_p25;
 use crate::config::Config;
 use crate::recorder::{CsvAppender, SHADOW_HEADER};
-use crate::types::{now_us, Bps, MarketDef, Signal, TradeTick};
+use crate::trade_store::TradeStore;
+use crate::types::{now_ms, Bps, MarketDef, Signal, TradeTick};
 
 const LEFTOVER_DUMP_MULT: f64 = 0.95;
-const SUSPICIOUS_TRADE_SIZE: f64 = 1_000.0;
 
 pub async fn run(
     cfg: Config,
@@ -23,11 +22,10 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut out = CsvAppender::open(shadow_path, &SHADOW_HEADER).context("open shadow_log.csv")?;
 
-    let retention_us = cfg.shadow.trade_retention_ms * 1_000;
-    let window_start_us = cfg.shadow.window_start_ms * 1_000;
-    let window_end_us = cfg.shadow.window_end_ms * 1_000;
+    let window_start_ms = cfg.shadow.window_start_ms;
+    let window_end_ms = cfg.shadow.window_end_ms;
 
-    let mut trades_by_token: HashMap<String, VecDeque<TradeTick>> = HashMap::new();
+    let mut store = TradeStore::new(cfg.shadow.trade_retention_ms);
     let mut pending: Vec<Signal> = Vec::new();
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -38,11 +36,7 @@ pub async fn run(
                 let Some(t) = maybe else {
                     return Err(anyhow::anyhow!("trade channel closed"));
                 };
-
-                let q = trades_by_token.entry(t.token_id.clone()).or_default();
-                q.push_back(t);
-
-                prune_trades(&mut trades_by_token, retention_us);
+                store.push(t);
             }
             maybe = signal_rx.recv() => {
                 let Some(s) = maybe else {
@@ -51,18 +45,18 @@ pub async fn run(
                 pending.push(s);
             }
             _ = tick.tick() => {
-                let now = now_us();
+                let now = now_ms();
                 if pending.is_empty() {
                     continue;
                 }
 
                 let mut still_pending = Vec::with_capacity(pending.len());
                 for s in pending.drain(..) {
-                    if now < s.ts_signal_us + window_end_us {
+                    if now < s.ts_ms + window_end_ms {
                         still_pending.push(s);
                         continue;
                     }
-                    settle_one(&cfg, &mut out, &trades_by_token, &s, window_start_us, window_end_us)?;
+                    settle_one(&cfg, &mut out, &store, &s, window_start_ms, window_end_ms)?;
                 }
                 pending = still_pending;
             }
@@ -70,25 +64,16 @@ pub async fn run(
     }
 }
 
-fn prune_trades(trades_by_token: &mut HashMap<String, VecDeque<TradeTick>>, retention_us: u64) {
-    let cutoff = now_us().saturating_sub(retention_us);
-    for q in trades_by_token.values_mut() {
-        while q.front().is_some_and(|t| t.ts_recv_us < cutoff) {
-            q.pop_front();
-        }
-    }
-}
-
 fn settle_one(
     cfg: &Config,
     out: &mut CsvAppender,
-    trades_by_token: &HashMap<String, VecDeque<TradeTick>>,
+    store: &TradeStore,
     s: &Signal,
-    window_start_us: u64,
-    window_end_us: u64,
+    window_start_ms: u64,
+    window_end_ms: u64,
 ) -> anyhow::Result<()> {
-    let start_us = s.ts_signal_us + window_start_us;
-    let end_us = s.ts_signal_us + window_end_us;
+    let start_ms = s.ts_ms + window_start_ms;
+    let end_ms = s.ts_ms + window_end_ms;
 
     let fill_share_used = fill_share_p25(s.bucket, &cfg.buckets);
 
@@ -96,37 +81,13 @@ fn settle_one(
     let mut q_fill: Vec<f64> = Vec::with_capacity(s.legs.len());
 
     for leg in &s.legs {
-        let mut v = 0.0f64;
-        let mut max_trade_size = 0.0f64;
-        let mut saw_suspicious_size = false;
-        if let Some(q) = trades_by_token.get(&leg.token_id) {
-            for t in q {
-                if t.market_id != s.market_id {
-                    continue;
-                }
-                if t.ts_recv_us < start_us || t.ts_recv_us > end_us {
-                    continue;
-                }
-                if t.size.is_finite() {
-                    max_trade_size = max_trade_size.max(t.size);
-                    if t.size >= SUSPICIOUS_TRADE_SIZE {
-                        saw_suspicious_size = true;
-                    }
-                }
-                if t.price <= leg.p_limit {
-                    v += t.size;
-                }
-            }
-        }
-        if saw_suspicious_size {
-            warn!(
-                signal_id = s.signal_id,
-                market_id = %s.market_id,
-                token_id = %leg.token_id,
-                max_trade_size,
-                "suspicious trade.size observed (verify whether Data API size is shares vs notional)"
-            );
-        }
+        let v = store.volume_at_or_better_price(
+            &s.market_id,
+            &leg.token_id,
+            start_ms,
+            end_ms,
+            leg.p_limit,
+        );
         v_mkt.push(v);
 
         let v_my = v * fill_share_used;
@@ -231,11 +192,12 @@ mod tests {
         BrainConfig, BucketConfig, Config, PolymarketConfig, RunConfig, ShadowConfig,
     };
     use crate::recorder::CsvAppender;
-    use crate::types::{Bps, Bucket, SignalLeg, Strategy};
+    use crate::types::{Bps, Bucket, BucketMode, SignalLeg, Strategy};
     use assert_approx_eq::assert_approx_eq;
 
     #[test]
     fn settles_binary_signal_with_leftover_penalty() {
+        let base_ms = now_ms();
         let cfg = Config {
             polymarket: PolymarketConfig::default(),
             run: RunConfig {
@@ -263,11 +225,18 @@ mod tests {
         let s = Signal {
             signal_id: 1,
             ts_signal_us: 1_000_000,
+            ts_ms: base_ms,
+            ts_snapshot_us: 0,
             market_id: "mkt".to_string(),
             strategy: Strategy::Binary,
             bucket: Bucket::Liquid,
+            bucket_mode: BucketMode::FullL2,
             q_req: 10.0,
-            expected_net_bps: Bps::new(20),
+            raw_cost_bps: Bps::from_price_cost(0.97),
+            raw_edge_bps: Bps::new(300),
+            hard_fees_bps: Bps::FEE_POLY + Bps::FEE_MERGE,
+            risk_premium_bps: Bps::new(80),
+            expected_net_bps: Bps::new(10),
             legs: vec![
                 SignalLeg {
                     token_id: "A".to_string(),
@@ -282,29 +251,23 @@ mod tests {
             ],
         };
 
-        let mut trades_by_token: HashMap<String, VecDeque<TradeTick>> = HashMap::new();
-        trades_by_token.insert(
-            "A".to_string(),
-            VecDeque::from([TradeTick {
-                ts_recv_us: 1_200_000,
-                market_id: "mkt".to_string(),
-                token_id: "A".to_string(),
-                price: 0.48,
-                size: 30.0,
-            }]),
-        );
-        trades_by_token.insert(
-            "B".to_string(),
-            VecDeque::from([TradeTick {
-                ts_recv_us: 1_200_000,
-                market_id: "mkt".to_string(),
-                token_id: "B".to_string(),
-                price: 0.48,
-                size: 12.0,
-            }]),
-        );
+        let mut store = TradeStore::new(60_000);
+        store.push(TradeTick {
+            ts_ms: base_ms + 200,
+            market_id: "mkt".to_string(),
+            token_id: "A".to_string(),
+            price: 0.48,
+            size: 30.0,
+        });
+        store.push(TradeTick {
+            ts_ms: base_ms + 200,
+            market_id: "mkt".to_string(),
+            token_id: "B".to_string(),
+            price: 0.48,
+            size: 12.0,
+        });
 
-        settle_one(&cfg, &mut out, &trades_by_token, &s, 100_000, 1_100_000).expect("settle");
+        settle_one(&cfg, &mut out, &store, &s, 100, 1_100).expect("settle");
 
         let text = std::fs::read_to_string(&tmp).expect("read csv");
         let mut lines = text.lines();
