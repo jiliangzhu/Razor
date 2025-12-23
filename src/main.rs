@@ -3,6 +3,8 @@ mod buckets;
 mod config;
 mod feed;
 mod recorder;
+mod report;
+mod schema;
 mod shadow;
 mod trade_store;
 mod types;
@@ -37,6 +39,18 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::load(&args.config).context("load config")?;
 
     std::fs::create_dir_all(&cfg.run.data_dir).context("create data_dir")?;
+    let run_start_ms = crate::types::now_ms();
+    if cfg.schema_version != schema::SCHEMA_VERSION {
+        return Err(anyhow!(
+            "schema_version mismatch: config={} code={}",
+            cfg.schema_version,
+            schema::SCHEMA_VERSION
+        ));
+    }
+    schema::write_schema_version_json(&cfg.run.data_dir, &cfg.schema_version, run_start_ms)
+        .context("write schema_version.json")?;
+    let run_id = schema::make_run_id(run_start_ms);
+    info!(%run_id, schema_version = %cfg.schema_version, "run start");
 
     let markets = feed::fetch_markets(&cfg).await.context("fetch markets")?;
     let (mut binary, mut triangle) = (0usize, 0usize);
@@ -86,17 +100,59 @@ async fn main() -> anyhow::Result<()> {
         trade_rx,
         signal_rx,
         shadow_path,
+        run_id.clone(),
     ));
 
-    tokio::select! {
-        res = ws_handle => { res.context("ws task join")??; }
-        res = trades_handle => { res.context("trades task join")??; }
-        res = brain_handle => { res.context("brain task join")??; }
-        res = shadow_handle => { res.context("shadow task join")??; }
+    let mut ws_handle = ws_handle;
+    let mut trades_handle = trades_handle;
+    let mut brain_handle = brain_handle;
+    let mut shadow_handle = shadow_handle;
+
+    enum ExitReason {
+        CtrlC,
+        Ws,
+        Trades,
+        Brain,
+        Shadow,
+    }
+
+    let exit_reason: ExitReason = tokio::select! {
+        res = &mut ws_handle => { res.context("ws task join")??; ExitReason::Ws }
+        res = &mut trades_handle => { res.context("trades task join")??; ExitReason::Trades }
+        res = &mut brain_handle => { res.context("brain task join")??; ExitReason::Brain }
+        res = &mut shadow_handle => { res.context("shadow task join")??; ExitReason::Shadow }
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received; shutting down");
+            ExitReason::CtrlC
         }
+    };
+
+    ws_handle.abort();
+    trades_handle.abort();
+    brain_handle.abort();
+    shadow_handle.abort();
+
+    match exit_reason {
+        ExitReason::CtrlC => {}
+        ExitReason::Ws => info!("ws task exited"),
+        ExitReason::Trades => info!("trades task exited"),
+        ExitReason::Brain => info!("brain task exited"),
+        ExitReason::Shadow => info!("shadow task exited"),
     }
+
+    let thresholds = report::ReportThresholds {
+        min_total_shadow_pnl: cfg.report.min_total_shadow_pnl,
+        min_avg_set_ratio: cfg.report.min_avg_set_ratio,
+    };
+    let report = report::generate_report_files(&cfg.run.data_dir, &run_id, thresholds)
+        .context("generate report")?;
+    info!(
+        run_id = %report.run_id,
+        total_shadow_pnl = report.totals.total_shadow_pnl,
+        avg_set_ratio = report.totals.avg_set_ratio,
+        go = report.verdict.go,
+        "report written"
+    );
 
     info!("done");
     Ok(())

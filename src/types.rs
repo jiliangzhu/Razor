@@ -252,6 +252,7 @@ pub struct Signal {
     pub strategy: Strategy,
     pub bucket: Bucket,
     pub bucket_mode: BucketMode,
+    pub worst_leg_token_id: String,
     pub q_req: f64,
     pub raw_cost_bps: Bps,
     pub raw_edge_bps: Bps,

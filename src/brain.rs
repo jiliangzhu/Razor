@@ -112,6 +112,9 @@ pub async fn run(
         };
 
         let q_req = cfg.brain.q_req;
+        let worst_leg_token_id = crate::buckets::worst_leg(&snap)
+            .map(|(leg, _)| leg.token_id.clone())
+            .unwrap_or_default();
         let legs: Vec<SignalLeg> = snap
             .legs
             .iter()
@@ -134,6 +137,7 @@ pub async fn run(
             strategy: metrics.strategy,
             bucket: metrics.bucket,
             bucket_mode: metrics.bucket_mode,
+            worst_leg_token_id,
             q_req,
             raw_cost_bps: metrics.raw_cost_bps,
             raw_edge_bps: metrics.raw_edge_bps,
@@ -269,7 +273,7 @@ fn should_emit(
 mod tests {
     use super::*;
     use crate::config::{
-        BrainConfig, BucketConfig, Config, PolymarketConfig, RunConfig, ShadowConfig,
+        BrainConfig, BucketConfig, Config, PolymarketConfig, ReportConfig, RunConfig, ShadowConfig,
     };
     use crate::types::LegSnapshot;
 
@@ -286,6 +290,7 @@ mod tests {
                 data_dir: "data".into(),
                 market_ids: vec![],
             },
+            schema_version: crate::schema::SCHEMA_VERSION.to_string(),
             brain: BrainConfig {
                 risk_premium_bps: 80,
                 min_net_edge_bps: 10,
@@ -294,6 +299,7 @@ mod tests {
             },
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),
+            report: ReportConfig::default(),
         };
 
         let snap = MarketSnapshot {
@@ -364,6 +370,7 @@ mod tests {
                 data_dir: "data".into(),
                 market_ids: vec![],
             },
+            schema_version: crate::schema::SCHEMA_VERSION.to_string(),
             brain: BrainConfig {
                 risk_premium_bps: 80,
                 min_net_edge_bps: 10,
@@ -372,6 +379,7 @@ mod tests {
             },
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),
+            report: ReportConfig::default(),
         };
 
         let snap = MarketSnapshot {

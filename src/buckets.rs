@@ -11,19 +11,9 @@ pub fn fill_share_p25(bucket: Bucket, cfg: &BucketConfig) -> f64 {
 }
 
 pub fn bucket_for_snapshot(snapshot: &MarketSnapshot) -> Bucket {
-    if snapshot.legs.is_empty() {
+    let Some((worst, worst_depth)) = worst_leg(snapshot) else {
         return Bucket::Thin;
-    }
-
-    let mut worst = &snapshot.legs[0];
-    let mut worst_depth = depth_sanitize(worst.ask_depth3_usdc);
-    for leg in &snapshot.legs[1..] {
-        let d = depth_sanitize(leg.ask_depth3_usdc);
-        if d < worst_depth {
-            worst_depth = d;
-            worst = leg;
-        }
-    }
+    };
 
     let spread_bps = spread_bps(worst.best_bid, worst.best_ask);
 
@@ -32,6 +22,19 @@ pub fn bucket_for_snapshot(snapshot: &MarketSnapshot) -> Bucket {
     } else {
         Bucket::Thin
     }
+}
+
+pub fn worst_leg(snapshot: &MarketSnapshot) -> Option<(&crate::types::LegSnapshot, f64)> {
+    let mut worst = snapshot.legs.first()?;
+    let mut worst_depth = depth_sanitize(worst.ask_depth3_usdc);
+    for leg in &snapshot.legs[1..] {
+        let d = depth_sanitize(leg.ask_depth3_usdc);
+        if d < worst_depth {
+            worst_depth = d;
+            worst = leg;
+        }
+    }
+    Some((worst, worst_depth))
 }
 
 fn depth_sanitize(depth3_usdc: f64) -> f64 {

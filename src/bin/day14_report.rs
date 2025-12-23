@@ -1,68 +1,96 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::Parser;
 
-use razor::report::{compute_day14_metrics, ReportCfg};
+use razor::report::{generate_report_files, ReportThresholds};
 
 #[derive(Parser, Debug)]
-#[command(name = "day14_report", about = "Project Razor Day14 report (GO/NO_GO)")]
+#[command(
+    name = "day14_report",
+    about = "Project Razor Day14 report (report.json + report.md)"
+)]
 struct Args {
     #[arg(long, default_value = "data")]
     data_dir: PathBuf,
-    #[arg(long, default_value = "shadow_log.csv")]
-    shadow_file: String,
-    #[arg(long, default_value_t = 0.15)]
-    legging_threshold: f64,
+    /// If omitted, uses the last non-empty run_id found in shadow_log.csv.
+    #[arg(long)]
+    run_id: Option<String>,
     #[arg(long, default_value_t = 0.0)]
-    pnl_threshold: f64,
-    #[arg(long, default_value = "day14_report.json")]
-    json_out: String,
+    min_total_shadow_pnl: f64,
+    #[arg(long, default_value_t = 0.85)]
+    min_avg_set_ratio: f64,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir).context("create data_dir")?;
 
-    let shadow_path = args.data_dir.join(&args.shadow_file);
-    let out_path = args.data_dir.join(&args.json_out);
-
-    let cfg = ReportCfg {
-        data_dir: args.data_dir.display().to_string(),
-        legging_ratio_threshold: args.legging_threshold,
-        pnl_threshold: args.pnl_threshold,
+    let run_id = match args.run_id {
+        Some(v) => v,
+        None => infer_last_run_id(&args.data_dir)?,
     };
 
-    let metrics = compute_day14_metrics(&shadow_path, &cfg)?;
+    let thresholds = ReportThresholds {
+        min_total_shadow_pnl: args.min_total_shadow_pnl,
+        min_avg_set_ratio: args.min_avg_set_ratio,
+    };
 
-    let json = serde_json::to_vec_pretty(&metrics).context("serialize json")?;
-    std::fs::write(&out_path, json).with_context(|| format!("write {}", out_path.display()))?;
+    let report = generate_report_files(&args.data_dir, &run_id, thresholds)?;
 
-    let pnl_pass = metrics.total_shadow_pnl > metrics.pnl_threshold;
-    let legging_pass =
-        metrics.q_fill_avg_sum > 0.0 && metrics.legging_ratio < metrics.legging_ratio_threshold;
-
-    println!("rows_total={}", metrics.rows_total);
-    println!("rows_ok={}", metrics.rows_ok);
-    println!("rows_bad={}", metrics.rows_bad);
-    println!("total_shadow_pnl={:.6}", metrics.total_shadow_pnl);
-    println!("pnl_by_bucket.Liquid={:.6}", metrics.pnl_by_bucket.liquid);
-    println!("pnl_by_bucket.Thin={:.6}", metrics.pnl_by_bucket.thin);
-    println!("pnl_by_bucket.Unknown={:.6}", metrics.pnl_by_bucket.unknown);
-    println!("q_req_sum={:.6}", metrics.q_req_sum);
-    println!("q_set_sum={:.6}", metrics.q_set_sum);
-    println!("q_fill_avg_sum={:.6}", metrics.q_fill_avg_sum);
-    println!("legging_ratio={:.6}", metrics.legging_ratio);
+    println!("run_id={}", report.run_id);
+    println!("total_shadow_pnl={:.6}", report.totals.total_shadow_pnl);
+    println!("avg_set_ratio={:.6}", report.totals.avg_set_ratio);
+    println!("go={}", report.verdict.go);
+    println!("reasons={}", report.verdict.reasons.join("; "));
     println!(
-        "legging_ratio_threshold={:.6}",
-        metrics.legging_ratio_threshold
+        "report_json={}",
+        args.data_dir
+            .join(razor::schema::FILE_REPORT_JSON)
+            .display()
     );
-    println!("pnl_threshold={:.6}", metrics.pnl_threshold);
-    println!("pass_total_shadow_pnl={pnl_pass}");
-    println!("pass_legging_ratio={legging_pass}");
-    println!("decision={}", metrics.decision);
-    println!("reasons={}", metrics.reasons.join("; "));
-    println!("json_out={}", out_path.display());
+    println!(
+        "report_md={}",
+        args.data_dir.join(razor::schema::FILE_REPORT_MD).display()
+    );
 
     Ok(())
+}
+
+fn infer_last_run_id(data_dir: &Path) -> anyhow::Result<String> {
+    let shadow_path = data_dir.join(razor::schema::FILE_SHADOW_LOG);
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .trim(csv::Trim::All)
+        .from_path(&shadow_path)
+        .with_context(|| format!("open {}", shadow_path.display()))?;
+
+    let header = rdr
+        .headers()
+        .with_context(|| format!("read header {}", shadow_path.display()))?
+        .clone();
+
+    let Some(run_id_idx) = header
+        .iter()
+        .position(|h| h.trim().eq_ignore_ascii_case("run_id"))
+    else {
+        anyhow::bail!("missing column run_id in {}", shadow_path.display());
+    };
+
+    let mut last: Option<String> = None;
+    for record in rdr.records() {
+        let record = match record {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let Some(v) = record.get(run_id_idx) else {
+            continue;
+        };
+        let v = v.trim();
+        if !v.is_empty() {
+            last = Some(v.to_string());
+        }
+    }
+
+    last.context("no run_id found in shadow_log.csv")
 }

@@ -8,12 +8,16 @@ pub struct Config {
     #[serde(default)]
     pub polymarket: PolymarketConfig,
     pub run: RunConfig,
+    #[serde(default = "default_schema_version")]
+    pub schema_version: String,
     #[serde(default)]
     pub brain: BrainConfig,
     #[serde(default)]
     pub buckets: BucketConfig,
     #[serde(default)]
     pub shadow: ShadowConfig,
+    #[serde(default)]
+    pub report: ReportConfig,
 }
 
 impl Config {
@@ -68,6 +72,10 @@ pub struct RunConfig {
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from("data")
+}
+
+fn default_schema_version() -> String {
+    crate::schema::SCHEMA_VERSION.to_string()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -178,4 +186,29 @@ fn default_trade_poll_limit() -> usize {
 
 fn default_trade_retention_ms() -> u64 {
     5000
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReportConfig {
+    #[serde(default = "default_report_min_total_shadow_pnl")]
+    pub min_total_shadow_pnl: f64,
+    #[serde(default = "default_report_min_avg_set_ratio")]
+    pub min_avg_set_ratio: f64,
+}
+
+impl Default for ReportConfig {
+    fn default() -> Self {
+        Self {
+            min_total_shadow_pnl: default_report_min_total_shadow_pnl(),
+            min_avg_set_ratio: default_report_min_avg_set_ratio(),
+        }
+    }
+}
+
+fn default_report_min_total_shadow_pnl() -> f64 {
+    0.0
+}
+
+fn default_report_min_avg_set_ratio() -> f64 {
+    0.85
 }
