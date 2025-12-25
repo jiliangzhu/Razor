@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 use crate::buckets::bucket_for_snapshot;
 use crate::config::Config;
 use crate::types::{
-    now_us, Bps, Bucket, BucketMode, MarketDef, MarketSnapshot, Signal, SignalLeg, Strategy,
+    now_us, Bps, Bucket, BucketMode, Leg, MarketDef, MarketSnapshot, Side, Signal, Strategy,
 };
 
 const COOLDOWN_IMPROVE_OVERRIDE_BPS: Bps = Bps::new(20);
@@ -115,13 +115,15 @@ pub async fn run(
         let worst_leg_token_id = crate::buckets::worst_leg(&snap)
             .map(|(leg, _)| leg.token_id.clone())
             .unwrap_or_default();
-        let legs: Vec<SignalLeg> = snap
+        let legs: Vec<Leg> = snap
             .legs
             .iter()
-            .map(|l| SignalLeg {
+            .map(|l| Leg {
                 token_id: l.token_id.clone(),
-                p_limit: l.best_ask,
-                best_bid_at_t0: l.best_bid,
+                side: Side::Buy,
+                limit_price: l.best_ask,
+                qty: q_req,
+                best_bid: l.best_bid,
             })
             .collect();
 
@@ -273,7 +275,8 @@ fn should_emit(
 mod tests {
     use super::*;
     use crate::config::{
-        BrainConfig, BucketConfig, Config, PolymarketConfig, ReportConfig, RunConfig, ShadowConfig,
+        BrainConfig, BucketConfig, CalibrationConfig, Config, LiveConfig, PolymarketConfig,
+        ReportConfig, RunConfig, ShadowConfig, SimConfig,
     };
     use crate::types::LegSnapshot;
 
@@ -300,6 +303,9 @@ mod tests {
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),
             report: ReportConfig::default(),
+            live: LiveConfig::default(),
+            calibration: CalibrationConfig::default(),
+            sim: SimConfig::default(),
         };
 
         let snap = MarketSnapshot {
@@ -309,6 +315,8 @@ mod tests {
                     token_id: "a".to_string(),
                     best_ask: 0.48,
                     best_bid: 0.4796,
+                    best_ask_size_best: 0.0,
+                    best_bid_size_best: 0.0,
                     ask_depth3_usdc: 1000.0,
                     ts_recv_us: 1,
                 },
@@ -316,6 +324,8 @@ mod tests {
                     token_id: "b".to_string(),
                     best_ask: 0.49,
                     best_bid: 0.4896,
+                    best_ask_size_best: 0.0,
+                    best_bid_size_best: 0.0,
                     ask_depth3_usdc: 1000.0,
                     ts_recv_us: 2,
                 },
@@ -380,6 +390,9 @@ mod tests {
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),
             report: ReportConfig::default(),
+            live: LiveConfig::default(),
+            calibration: CalibrationConfig::default(),
+            sim: SimConfig::default(),
         };
 
         let snap = MarketSnapshot {
@@ -389,6 +402,8 @@ mod tests {
                     token_id: "a".to_string(),
                     best_ask: 0.6,
                     best_bid: 0.5992,
+                    best_ask_size_best: 0.0,
+                    best_bid_size_best: 0.0,
                     ask_depth3_usdc: 1_000.0,
                     ts_recv_us: 0,
                 },
@@ -396,6 +411,8 @@ mod tests {
                     token_id: "b".to_string(),
                     best_ask: 0.6,
                     best_bid: 0.5992,
+                    best_ask_size_best: 0.0,
+                    best_bid_size_best: 0.0,
                     ask_depth3_usdc: 1_000.0,
                     ts_recv_us: 0,
                 },

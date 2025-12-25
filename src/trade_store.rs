@@ -55,6 +55,31 @@ impl TradeStore {
             .sum()
     }
 
+    #[allow(dead_code)]
+    pub fn volume_in_window(
+        &self,
+        market_id: &str,
+        token_id: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> f64 {
+        if token_id.is_empty() || market_id.is_empty() {
+            return 0.0;
+        }
+        if start_ms > end_ms {
+            return 0.0;
+        }
+
+        self.trades
+            .iter()
+            .filter(|t| t.market_id == market_id)
+            .filter(|t| t.token_id == token_id)
+            .filter(|t| t.ts_ms >= start_ms && t.ts_ms <= end_ms)
+            .filter(|t| t.size.is_finite())
+            .map(|t| t.size)
+            .sum()
+    }
+
     fn trim(&mut self, now_ms: u64) {
         if self.retention_ms == 0 {
             self.trades.clear();

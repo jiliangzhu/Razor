@@ -73,7 +73,9 @@ pub async fn fetch_markets(cfg: &Config) -> anyhow::Result<Vec<MarketDef>> {
 struct LegState {
     token_id: String,
     best_ask: f64,
+    best_ask_size_best: f64,
     best_bid: f64,
+    best_bid_size_best: f64,
     ask_depth3_usdc: f64,
     ts_recv_us: u64,
     ready: bool,
@@ -110,7 +112,9 @@ pub async fn run_market_ws(
             .map(|token_id| LegState {
                 token_id: token_id.clone(),
                 best_ask: 0.0,
+                best_ask_size_best: 0.0,
                 best_bid: 0.0,
+                best_bid_size_best: 0.0,
                 ask_depth3_usdc: 0.0,
                 ts_recv_us: 0,
                 ready: false,
@@ -292,10 +296,10 @@ fn handle_ws_obj(
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
 
-    let Some(best_bid) = best_price(bids, PriceSide::Bid) else {
+    let Some((best_bid, best_bid_size_best)) = best_level(bids, PriceSide::Bid) else {
         return Ok(());
     };
-    let Some(best_ask) = best_price(asks, PriceSide::Ask) else {
+    let Some((best_ask, best_ask_size_best)) = best_level(asks, PriceSide::Ask) else {
         return Ok(());
     };
 
@@ -326,6 +330,8 @@ fn handle_ws_obj(
     let leg = &mut state.legs[*idx];
     leg.best_bid = best_bid;
     leg.best_ask = best_ask;
+    leg.best_bid_size_best = best_bid_size_best;
+    leg.best_ask_size_best = best_ask_size_best;
     leg.ask_depth3_usdc = ask_depth3_usdc;
     leg.ts_recv_us = ts_recv_us;
     leg.ready = true;
@@ -340,6 +346,8 @@ fn handle_ws_obj(
                     token_id: l.token_id.clone(),
                     best_ask: l.best_ask,
                     best_bid: l.best_bid,
+                    best_ask_size_best: l.best_ask_size_best,
+                    best_bid_size_best: l.best_bid_size_best,
                     ask_depth3_usdc: l.ask_depth3_usdc,
                     ts_recv_us: l.ts_recv_us,
                 })
@@ -357,8 +365,8 @@ enum PriceSide {
     Ask,
 }
 
-fn best_price(levels: &[serde_json::Value], side: PriceSide) -> Option<f64> {
-    let mut best: Option<f64> = None;
+fn best_level(levels: &[serde_json::Value], side: PriceSide) -> Option<(f64, f64)> {
+    let mut best: Option<(f64, f64)> = None;
     for lvl in levels {
         let Some(p) = lvl.get("price").and_then(|v| v.as_str()) else {
             continue;
@@ -366,10 +374,30 @@ fn best_price(levels: &[serde_json::Value], side: PriceSide) -> Option<f64> {
         let Ok(px) = p.parse::<f64>() else {
             continue;
         };
+
+        let sz = lvl
+            .get("size")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(0.0);
+
         best = match (best, side) {
-            (None, _) => Some(px),
-            (Some(cur), PriceSide::Bid) => Some(cur.max(px)),
-            (Some(cur), PriceSide::Ask) => Some(cur.min(px)),
+            (None, _) => Some((px, sz)),
+            (Some((cur_px, cur_sz)), PriceSide::Bid) => {
+                if px > cur_px {
+                    Some((px, sz))
+                } else {
+                    Some((cur_px, cur_sz))
+                }
+            }
+            (Some((cur_px, cur_sz)), PriceSide::Ask) => {
+                if px < cur_px {
+                    Some((px, sz))
+                } else {
+                    Some((cur_px, cur_sz))
+                }
+            }
         };
     }
     best

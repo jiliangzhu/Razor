@@ -189,20 +189,22 @@ impl Strategy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Bucket {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LiquidityBucket {
     Liquid,
     Thin,
 }
 
-impl Bucket {
+impl LiquidityBucket {
     pub fn as_str(self) -> &'static str {
         match self {
-            Bucket::Liquid => "Liquid",
-            Bucket::Thin => "Thin",
+            LiquidityBucket::Liquid => "Liquid",
+            LiquidityBucket::Thin => "Thin",
         }
     }
 }
+
+pub type Bucket = LiquidityBucket;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BucketMode {
@@ -223,7 +225,9 @@ impl BucketMode {
 pub struct LegSnapshot {
     pub token_id: String,
     pub best_ask: f64,
+    pub best_ask_size_best: f64,
     pub best_bid: f64,
+    pub best_bid_size_best: f64,
     pub ask_depth3_usdc: f64,
     #[allow(dead_code)]
     pub ts_recv_us: u64,
@@ -235,12 +239,31 @@ pub struct MarketSnapshot {
     pub legs: Vec<LegSnapshot>,
 }
 
-#[derive(Clone, Debug)]
-pub struct SignalLeg {
-    pub token_id: String,
-    pub p_limit: f64,
-    pub best_bid_at_t0: f64,
+#[derive(Clone, Copy, Debug)]
+pub enum Side {
+    Buy,
+    Sell,
 }
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderLeg {
+    pub token_id: String,
+    pub side: Side,
+    pub limit_price: f64,
+    pub qty: f64,
+    pub best_bid: f64,
+}
+
+pub type Leg = OrderLeg;
 
 #[derive(Clone, Debug)]
 pub struct Signal {
@@ -259,7 +282,32 @@ pub struct Signal {
     pub hard_fees_bps: Bps,
     pub risk_premium_bps: Bps,
     pub expected_net_bps: Bps,
-    pub legs: Vec<SignalLeg>,
+    pub legs: Vec<OrderLeg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillStatus {
+    None,
+    Partial,
+    Full,
+}
+
+impl FillStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FillStatus::None => "NONE",
+            FillStatus::Partial => "PARTIAL",
+            FillStatus::Full => "FULL",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FillReport {
+    pub requested_qty: f64,
+    pub filled_qty: f64,
+    pub avg_price: f64,
+    pub status: FillStatus,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

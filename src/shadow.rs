@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::recorder::{CsvAppender, SHADOW_HEADER};
 use crate::schema::DUMP_SLIPPAGE_ASSUMED;
 use crate::trade_store::TradeStore;
-use crate::types::{now_ms, Bps, MarketDef, Signal, TradeTick};
+use crate::types::{now_ms, Bps, Leg, MarketDef, Side, Signal, TradeTick};
 
 const LEFTOVER_DUMP_MULT: f64 = 1.0 - DUMP_SLIPPAGE_ASSUMED;
 
@@ -98,7 +98,7 @@ fn settle_one(
             &leg.token_id,
             start_ms,
             end_ms,
-            leg.p_limit,
+            leg.limit_price,
         );
         v_mkt.push(v);
 
@@ -126,10 +126,12 @@ fn settle_one(
 
     let mut legs = s.legs.clone();
     while legs.len() < 3 {
-        legs.push(crate::types::SignalLeg {
+        legs.push(Leg {
             token_id: "".to_string(),
-            p_limit: 0.0,
-            best_bid_at_t0: 0.0,
+            side: Side::Buy,
+            limit_price: 0.0,
+            qty: 0.0,
+            best_bid: 0.0,
         });
         v_mkt.push(0.0);
         q_fill.push(0.0);
@@ -138,7 +140,7 @@ fn settle_one(
     let cost_per_set: f64 = legs
         .iter()
         .take(3)
-        .map(|l| Bps::FEE_POLY.apply_cost(l.p_limit))
+        .map(|l| Bps::FEE_POLY.apply_cost(l.limit_price))
         .sum();
     let proceeds_per_set = Bps::FEE_MERGE.apply_proceeds(1.0);
 
@@ -148,8 +150,8 @@ fn settle_one(
 
     let mut pnl_left_total = 0.0f64;
     for (i, l) in legs.iter().take(3).enumerate() {
-        let exit = l.best_bid_at_t0 * LEFTOVER_DUMP_MULT;
-        let cost = q_left[i] * Bps::FEE_POLY.apply_cost(l.p_limit);
+        let exit = l.best_bid * LEFTOVER_DUMP_MULT;
+        let cost = q_left[i] * Bps::FEE_POLY.apply_cost(l.limit_price);
         let proceeds = q_left[i] * Bps::FEE_POLY.apply_proceeds(exit);
         pnl_left_total += proceeds - cost;
     }
@@ -186,18 +188,18 @@ fn settle_one(
         (legs_n as u8).to_string(),
         q_set.to_string(),
         legs[0].token_id.clone(),
-        legs[0].p_limit.to_string(),
-        legs[0].best_bid_at_t0.to_string(),
+        legs[0].limit_price.to_string(),
+        legs[0].best_bid.to_string(),
         v_mkt[0].to_string(),
         q_fill[0].to_string(),
         legs[1].token_id.clone(),
-        legs[1].p_limit.to_string(),
-        legs[1].best_bid_at_t0.to_string(),
+        legs[1].limit_price.to_string(),
+        legs[1].best_bid.to_string(),
         v_mkt[1].to_string(),
         q_fill[1].to_string(),
         legs[2].token_id.clone(),
-        legs[2].p_limit.to_string(),
-        legs[2].best_bid_at_t0.to_string(),
+        legs[2].limit_price.to_string(),
+        legs[2].best_bid.to_string(),
         v_mkt[2].to_string(),
         q_fill[2].to_string(),
         cost_set.to_string(),
@@ -231,10 +233,11 @@ fn settle_one(
 mod tests {
     use super::*;
     use crate::config::{
-        BrainConfig, BucketConfig, Config, PolymarketConfig, ReportConfig, RunConfig, ShadowConfig,
+        BrainConfig, BucketConfig, CalibrationConfig, Config, LiveConfig, PolymarketConfig,
+        ReportConfig, RunConfig, ShadowConfig, SimConfig,
     };
     use crate::recorder::CsvAppender;
-    use crate::types::{Bps, Bucket, BucketMode, SignalLeg, Strategy};
+    use crate::types::{Bps, Bucket, BucketMode, Leg, Side, Strategy};
     use assert_approx_eq::assert_approx_eq;
 
     #[test]
@@ -259,6 +262,9 @@ mod tests {
             },
             shadow: ShadowConfig::default(),
             report: ReportConfig::default(),
+            live: LiveConfig::default(),
+            calibration: CalibrationConfig::default(),
+            sim: SimConfig::default(),
         };
 
         let tmp =
@@ -283,15 +289,19 @@ mod tests {
             risk_premium_bps: Bps::new(80),
             expected_net_bps: Bps::new(10),
             legs: vec![
-                SignalLeg {
+                Leg {
                     token_id: "A".to_string(),
-                    p_limit: 0.49,
-                    best_bid_at_t0: 0.48,
+                    side: Side::Buy,
+                    limit_price: 0.49,
+                    qty: 10.0,
+                    best_bid: 0.48,
                 },
-                SignalLeg {
+                Leg {
                     token_id: "B".to_string(),
-                    p_limit: 0.48,
-                    best_bid_at_t0: 0.47,
+                    side: Side::Buy,
+                    limit_price: 0.48,
+                    qty: 10.0,
+                    best_bid: 0.47,
                 },
             ],
         };

@@ -25,3 +25,29 @@ trade_poll_interval_ms = 1000
 trade_poll_limit = 500
 trade_retention_ms = 5000
 
+[live]
+# PR-B: must remain false (SIM live only; no real orders)
+enabled = false
+
+# Ladder behavior (bps)
+chase_cap_bps = 200
+ladder_step1_bps = 10
+
+# Panic flattening discount levels (bps)
+flatten_lvl1_bps = 100
+flatten_lvl2_bps = 500
+flatten_lvl3_bps = 1000
+flatten_max_attempts = 3
+
+# Per-signal cooldown in live mode
+cooldown_ms = 1000
+
+[calibration]
+min_samples_per_bucket = 30
+suggest_filename = "calibration_suggest.toml"
+quantile = 0.25
+
+[sim]
+sim_fill_share_liquid = 0.30
+sim_fill_share_thin = 0.10
+sim_network_latency_ms = 120

@@ -28,3 +28,11 @@ RAZOR_MODE=dry_run cargo run --release -- --config config.toml
 ```bash
 python3 scripts/day14_report.py data/shadow_log.csv
 ```
+
+## Phase 2 (live) smoke
+
+```bash
+RAZOR_MODE=live cargo run --release -- --config config.toml
+```
+
+当 `live.enabled=false`（默认）时，只跑 OMS 状态机与落盘，不会发真实订单。

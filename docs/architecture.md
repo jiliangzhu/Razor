@@ -24,6 +24,11 @@
 - 启用 Sniper OMS，严格限制（总资金 $100，微仓位）。
 - 按桶（Liquid/Thin）校准 `fill_share_*_p25`，每周滚动更新。
 
+Phase 2（live）新增落盘：
+- `trade_log.csv`：OMS 执行轨迹（每次下单 intent + ack + fills + 结果）
+- `calibration_log.csv`：按桶累计真实 `real_fill_share` 样本与建议 p25
+- `calibration_suggest.toml`：可回填建议（不自动改 config）
+
 ### Phase 3（Day 31–90）：规模化
 - AWS 部署属于运维动作，不是架构重构。
 - 只在 Phase 2 实盘 PnL 为正后再扩容。

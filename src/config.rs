@@ -18,6 +18,12 @@ pub struct Config {
     pub shadow: ShadowConfig,
     #[serde(default)]
     pub report: ReportConfig,
+    #[serde(default)]
+    pub live: LiveConfig,
+    #[serde(default)]
+    pub calibration: CalibrationConfig,
+    #[serde(default)]
+    pub sim: SimConfig,
 }
 
 impl Config {
@@ -211,4 +217,131 @@ fn default_report_min_total_shadow_pnl() -> f64 {
 
 fn default_report_min_avg_set_ratio() -> f64 {
     0.85
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LiveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_live_chase_cap_bps")]
+    pub chase_cap_bps: i32,
+    #[serde(default = "default_live_ladder_step1_bps")]
+    pub ladder_step1_bps: i32,
+    #[serde(default = "default_live_flatten_lvl1_bps")]
+    pub flatten_lvl1_bps: i32,
+    #[serde(default = "default_live_flatten_lvl2_bps")]
+    pub flatten_lvl2_bps: i32,
+    #[serde(default = "default_live_flatten_lvl3_bps")]
+    pub flatten_lvl3_bps: i32,
+    #[serde(default = "default_live_flatten_max_attempts")]
+    pub flatten_max_attempts: u8,
+    #[serde(default = "default_live_cooldown_ms")]
+    pub cooldown_ms: u64,
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chase_cap_bps: default_live_chase_cap_bps(),
+            ladder_step1_bps: default_live_ladder_step1_bps(),
+            flatten_lvl1_bps: default_live_flatten_lvl1_bps(),
+            flatten_lvl2_bps: default_live_flatten_lvl2_bps(),
+            flatten_lvl3_bps: default_live_flatten_lvl3_bps(),
+            flatten_max_attempts: default_live_flatten_max_attempts(),
+            cooldown_ms: default_live_cooldown_ms(),
+        }
+    }
+}
+
+fn default_live_chase_cap_bps() -> i32 {
+    200
+}
+
+fn default_live_ladder_step1_bps() -> i32 {
+    10
+}
+
+fn default_live_flatten_lvl1_bps() -> i32 {
+    100
+}
+
+fn default_live_flatten_lvl2_bps() -> i32 {
+    500
+}
+
+fn default_live_flatten_lvl3_bps() -> i32 {
+    1000
+}
+
+fn default_live_flatten_max_attempts() -> u8 {
+    3
+}
+
+fn default_live_cooldown_ms() -> u64 {
+    1000
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CalibrationConfig {
+    #[serde(default = "default_calibration_min_samples_per_bucket")]
+    pub min_samples_per_bucket: usize,
+    #[serde(default = "default_calibration_suggest_filename")]
+    pub suggest_filename: String,
+    #[serde(default = "default_calibration_quantile")]
+    pub quantile: f64,
+}
+
+impl Default for CalibrationConfig {
+    fn default() -> Self {
+        Self {
+            min_samples_per_bucket: default_calibration_min_samples_per_bucket(),
+            suggest_filename: default_calibration_suggest_filename(),
+            quantile: default_calibration_quantile(),
+        }
+    }
+}
+
+fn default_calibration_min_samples_per_bucket() -> usize {
+    30
+}
+
+fn default_calibration_suggest_filename() -> String {
+    crate::schema::FILE_CALIBRATION_SUGGEST.to_string()
+}
+
+fn default_calibration_quantile() -> f64 {
+    0.25
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SimConfig {
+    #[serde(default = "default_sim_fill_share_liquid")]
+    pub sim_fill_share_liquid: f64,
+    #[serde(default = "default_sim_fill_share_thin")]
+    pub sim_fill_share_thin: f64,
+    #[serde(default = "default_sim_network_latency_ms")]
+    pub sim_network_latency_ms: u64,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        Self {
+            sim_fill_share_liquid: default_sim_fill_share_liquid(),
+            sim_fill_share_thin: default_sim_fill_share_thin(),
+            sim_network_latency_ms: default_sim_network_latency_ms(),
+        }
+    }
+}
+
+fn default_sim_fill_share_liquid() -> f64 {
+    0.30
+}
+
+fn default_sim_fill_share_thin() -> f64 {
+    0.10
+}
+
+fn default_sim_network_latency_ms() -> u64 {
+    120
 }

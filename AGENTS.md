@@ -56,6 +56,8 @@ PR-006：Shadow（窗口统计 + 成套会计 + 写 shadow_log.csv）
 PR-007：Day14 report 脚本（GO/NO GO）  
 PR-008：挂机稳态修补（backpressure、心跳、可观测性）
 
+PR-B：Phase 2 Live（OMS/Sniper + trade_log.csv + calibration_log.csv + calibration_suggest.toml）
+
 每个 PR 必须附：
 - 本地运行命令
 - smoke check

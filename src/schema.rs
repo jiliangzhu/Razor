@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Context as _;
 use serde::Serialize;
 
-pub const SCHEMA_VERSION: &str = "v1.3.2a-prA";
+pub const SCHEMA_VERSION: &str = "v1.3.2a-prB";
 
 pub const FILE_TICKS: &str = "ticks.csv";
 pub const FILE_TRADES: &str = "trades.csv";
@@ -12,6 +12,9 @@ pub const FILE_SHADOW_LOG: &str = "shadow_log.csv";
 pub const FILE_REPORT_JSON: &str = "report.json";
 pub const FILE_REPORT_MD: &str = "report.md";
 pub const FILE_SCHEMA_VERSION: &str = "schema_version.json";
+pub const FILE_TRADE_LOG: &str = "trade_log.csv";
+pub const FILE_CALIBRATION_LOG: &str = "calibration_log.csv";
+pub const FILE_CALIBRATION_SUGGEST: &str = "calibration_suggest.toml";
 
 pub const DUMP_SLIPPAGE_ASSUMED: f64 = 0.05;
 
@@ -56,6 +59,39 @@ pub const SHADOW_HEADER: [&str; 38] = [
     "notes",
 ];
 
+pub const TRADE_LOG_HEADER: [&str; 16] = [
+    "ts_ms",
+    "signal_id",
+    "market_id",
+    "strategy",
+    "bucket",
+    "phase",
+    "action",
+    "leg_index",
+    "token_id",
+    "side",
+    "limit_price",
+    "req_qty",
+    "fill_qty",
+    "fill_status",
+    "expected_net_bps",
+    "notes",
+];
+
+pub const CALIBRATION_LOG_HEADER: [&str; 11] = [
+    "ts_ms",
+    "bucket",
+    "market_id",
+    "token_id",
+    "side",
+    "req_qty",
+    "filled_qty",
+    "market_ask_size_best",
+    "market_bid_size_best",
+    "sim_fill_share_used",
+    "mode",
+];
+
 #[derive(Debug, Serialize)]
 struct SchemaVersionFile {
     schema_version: String,
@@ -74,6 +110,9 @@ pub fn write_schema_version_json(
     files.insert(FILE_SHADOW_LOG.to_string(), "v2".to_string());
     files.insert(FILE_REPORT_JSON.to_string(), "v1".to_string());
     files.insert(FILE_REPORT_MD.to_string(), "v1".to_string());
+    files.insert(FILE_TRADE_LOG.to_string(), "v1".to_string());
+    files.insert(FILE_CALIBRATION_LOG.to_string(), "v1".to_string());
+    files.insert(FILE_CALIBRATION_SUGGEST.to_string(), "v1".to_string());
 
     let payload = SchemaVersionFile {
         schema_version: schema_version.to_string(),
