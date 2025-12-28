@@ -87,7 +87,7 @@ graph TD
 ### 2.3 Signal（Brain -> Shadow）
 Shadow 会计输入：
 - `signal_id`
-- `ts_signal_us`
+- `signal_ts_ms`
 - `market_id`
 - `strategy`（binary / triangle）
 - `bucket`（Liquid / Thin）
@@ -95,14 +95,18 @@ Shadow 会计输入：
 - `expected_net_bps: Bps`
 - `legs: Vec<SignalLeg>`：
   - `token_id`
-  - `p_limit`（f64）
-  - `best_bid_at_t0`（f64，可在结算时刷新）
+  - `limit_price`（f64）
+  - `best_bid_at_signal`（f64，会计锚点；残渣处刑以此为基准）
+  - `best_ask_at_signal`（f64，可选：审计用）
 
 ### 2.4 TradeTick（Feed -> Shadow）
 **不信 side，不用 side**。只看：
-- `ts_recv_us`
+- `ingest_ts_ms`（本地接收时间，ms；Shadow 窗口以此对齐）
+- `exchange_ts_ms`（交易所时间戳，ms，可空）
+- `ts_ms`（Phase1 口径：本地 ingest 时间；与 `ingest_ts_ms` 一致，TS_SRC=local）
 - `market_id`, `token_id`
 - `price`, `size`
+- `trade_id`（去重与审计用；如 API 无 id 则构造稳定 key）
 
 ---
 
@@ -132,7 +136,7 @@ Brain + Shadow 共享桶逻辑。对每条腿 i：
 
 ### Bps 域净优势
 令 `sum_prices = Σ best_ask_i`：
-- `raw_cost_bps = floor(sum_prices * 10000)`
+- `raw_cost_bps = ceil(sum_prices * 10000)`（成本侧向上取整，避免虚高 edge）
 - `raw_edge_bps = 10000 - raw_cost_bps`
 
 成本（Bps）：
@@ -176,13 +180,15 @@ Phase 1 策略范围：
 ### D：会计损益（Matched Set + Leftover Dump）
 
 成套（安全）：
-- `Cost_set = Q_set * Σ P_i`
-- `Proceeds_set = Q_set * 1.0`
-- `PnL_set = Proceeds_set - Cost_set - fee_wear`（保守扣除常量费用）
+- `Cost_set = Q_set * Σ FEE_POLY.apply_cost(P_i)`
+- `Proceeds_set = Q_set * FEE_MERGE.apply_proceeds(1.0)`
+- `PnL_set = Proceeds_set - Cost_set`
 
 残渣（处刑）：
-- `Exit_i = best_bid_i * 0.95`
-- `PnL_left_i = Q_left_i * (Exit_i - P_i) - fee_left`
+- `Exit_i = best_bid_at_signal_i * 0.95`（会计锚点来自 Signal，不允许用后续最新 bid 替代）
+- `Cost_left_i = Q_left_i * FEE_POLY.apply_cost(P_i)`
+- `Proceeds_left_i = Q_left_i * FEE_POLY.apply_proceeds(Exit_i)`
+- `PnL_left_i = Proceeds_left_i - Cost_left_i`
 
 总计：
 - `PnL_total = PnL_set + Σ PnL_left_i`
@@ -196,24 +202,16 @@ Phase 1 策略范围：
 
 ## 6. 日志与 Schema（冻结）
 
-日志追加写入，不改列名、不改顺序。
+日志追加写入，不改列名、不改顺序。每次运行落盘到独立目录：
+- `data/run_<run_id>/...`
+- `data/run_latest` 指向最新 run
 
 ### trades.csv（最小）
-- `ts_recv_us, market_id, token_id, price, size`
+- `ts_ms, market_id, token_id, price, size, trade_id, ingest_ts_ms, exchange_ts_ms`
 
 ### shadow_log.csv（建议固定列，Phase 1 最多 3 腿）
-基础：
-- `ts_signal_us, signal_id, market_id, strategy, bucket, q_req`
-每腿：
-- `token1, p1, v_mkt1, q_fill1, best_bid1, exit1`
-- `token2, p2, v_mkt2, q_fill2, best_bid2, exit2`
-- `token3, p3, v_mkt3, q_fill3, best_bid3, exit3`
-成套/残渣：
-- `q_set, q_left1, q_left2, q_left3, set_ratio`
-PnL：
-- `pnl_set, pnl_left, pnl_total`
-参数：
-- `fill_share_used, risk_premium_bps, expected_net_bps`
+建议采用固定宽表（最多 3 腿），并写全成套/残渣拆账中间量，便于追责与复盘。
+权威 header 以代码为准：`src/schema.rs::SHADOW_HEADER`。
 
 ---
 

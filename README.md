@@ -2,37 +2,16 @@
 
 唯一真相：`docs/architecture.md`（规格冻结）。Phase 1 禁止任何交易写操作。
 
-## Quickstart
+## Phase 1 dry-run
 
 ```bash
-cp config.example.toml config.toml
-RAZOR_MODE=dry_run cargo run --release -- --config config.toml
+RAZOR_MODE=dry_run cargo run -- --config config/config.toml
 ```
 
-输出日志（追加写入）：
-- `data/trades.csv`
-- `data/ticks.csv`
-- `data/shadow_log.csv`
-- `data/raw_ws.jsonl`（可选：原始 WS 录制，用于复核/回放）
-
-`data/trades.csv` schema（v1.3.2-b 起）：
-- header：`ts_ms,market_id,token_id,price,size`（如已有旧版 `ts_recv_us`，请删除旧文件再跑）
-
-## Smoke check
-
-1) 运行 60s：`RAZOR_MODE=dry_run cargo run --release -- --config config.toml`
-2) 检查文件增长：`ls -lh data/*.csv data/raw_ws.jsonl`
+`data/run_latest` 指向最后一次运行结果目录。
 
 ## Day 14 report
 
 ```bash
-python3 scripts/day14_report.py data/shadow_log.csv
+cargo run --bin day14_report -- --data-dir data/run_latest
 ```
-
-## Phase 2 (live) smoke
-
-```bash
-RAZOR_MODE=live cargo run --release -- --config config.toml
-```
-
-当 `live.enabled=false`（默认）时，只跑 OMS 状态机与落盘，不会发真实订单。

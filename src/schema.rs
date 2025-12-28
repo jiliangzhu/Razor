@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Context as _;
 use serde::Serialize;
 
-pub const SCHEMA_VERSION: &str = "v1.3.2a-prB";
+pub const SCHEMA_VERSION: &str = "shadow_log_v1";
 
 pub const FILE_TICKS: &str = "ticks.csv";
 pub const FILE_TRADES: &str = "trades.csv";
@@ -12,11 +12,27 @@ pub const FILE_SHADOW_LOG: &str = "shadow_log.csv";
 pub const FILE_REPORT_JSON: &str = "report.json";
 pub const FILE_REPORT_MD: &str = "report.md";
 pub const FILE_SCHEMA_VERSION: &str = "schema_version.json";
+pub const FILE_RUN_CONFIG: &str = "config.toml";
+pub const FILE_META_JSON: &str = "meta.json";
+pub const FILE_RUN_META_JSON: &str = "run_meta.json";
+pub const FILE_HEALTH_JSONL: &str = "health.jsonl";
+pub const FILE_RAW_WS_JSONL: &str = "raw_ws.jsonl";
 pub const FILE_TRADE_LOG: &str = "trade_log.csv";
 pub const FILE_CALIBRATION_LOG: &str = "calibration_log.csv";
 pub const FILE_CALIBRATION_SUGGEST: &str = "calibration_suggest.toml";
 
 pub const DUMP_SLIPPAGE_ASSUMED: f64 = 0.05;
+
+pub const TRADES_HEADER: [&str; 8] = [
+    "ts_ms",
+    "market_id",
+    "token_id",
+    "price",
+    "size",
+    "trade_id",
+    "ingest_ts_ms",
+    "exchange_ts_ms",
+];
 
 pub const SHADOW_HEADER: [&str; 38] = [
     "run_id",
@@ -59,6 +75,7 @@ pub const SHADOW_HEADER: [&str; 38] = [
     "notes",
 ];
 
+#[allow(dead_code)]
 pub const TRADE_LOG_HEADER: [&str; 16] = [
     "ts_ms",
     "signal_id",
@@ -78,6 +95,7 @@ pub const TRADE_LOG_HEADER: [&str; 16] = [
     "notes",
 ];
 
+#[allow(dead_code)]
 pub const CALIBRATION_LOG_HEADER: [&str; 11] = [
     "ts_ms",
     "bucket",
@@ -105,9 +123,15 @@ pub fn write_schema_version_json(
     generated_at_unix_ms: u64,
 ) -> anyhow::Result<()> {
     let mut files = BTreeMap::new();
+    files.insert(FILE_SCHEMA_VERSION.to_string(), "v1".to_string());
+    files.insert(FILE_RUN_CONFIG.to_string(), "v1".to_string());
+    files.insert(FILE_META_JSON.to_string(), "v1".to_string());
+    files.insert(FILE_RUN_META_JSON.to_string(), "v1".to_string());
+    files.insert(FILE_HEALTH_JSONL.to_string(), "v1".to_string());
+    files.insert(FILE_RAW_WS_JSONL.to_string(), "v1".to_string());
     files.insert(FILE_TICKS.to_string(), "v1".to_string());
-    files.insert(FILE_TRADES.to_string(), "v1".to_string());
-    files.insert(FILE_SHADOW_LOG.to_string(), "v2".to_string());
+    files.insert(FILE_TRADES.to_string(), "v3".to_string());
+    files.insert(FILE_SHADOW_LOG.to_string(), "v5".to_string());
     files.insert(FILE_REPORT_JSON.to_string(), "v1".to_string());
     files.insert(FILE_REPORT_MD.to_string(), "v1".to_string());
     files.insert(FILE_TRADE_LOG.to_string(), "v1".to_string());
@@ -124,8 +148,4 @@ pub fn write_schema_version_json(
     let json = serde_json::to_vec_pretty(&payload).context("serialize schema_version.json")?;
     std::fs::write(&out_path, json).with_context(|| format!("write {}", out_path.display()))?;
     Ok(())
-}
-
-pub fn make_run_id(start_unix_ms: u64) -> String {
-    format!("run_{start_unix_ms}")
 }

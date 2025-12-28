@@ -24,6 +24,14 @@ fn header_line() -> String {
     s
 }
 
+fn idx(name: &str) -> usize {
+    SHADOW_HEADER
+        .iter()
+        .position(|h| h.trim().eq_ignore_ascii_case(name))
+        .unwrap_or_else(|| panic!("missing column {name} in SHADOW_HEADER"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn row(
     run_id: &str,
     signal_id: u64,
@@ -35,18 +43,17 @@ fn row(
     set_ratio: &str,
 ) -> String {
     let mut cols: Vec<String> = vec![String::new(); SHADOW_HEADER.len()];
-    cols[0] = run_id.to_string();
-    cols[1] = SCHEMA_VERSION.to_string();
-    cols[2] = signal_id.to_string();
-    cols[3] = ts_ms.to_string();
-    cols[4] = "100".to_string();
-    cols[5] = "1100".to_string();
-    cols[6] = market_id.to_string();
-    cols[7] = strategy.to_string();
-    cols[8] = bucket.to_string();
-    cols[11] = "2".to_string();
-    cols[32] = total_pnl.to_string();
-    cols[34] = set_ratio.to_string();
+    cols[idx("run_id")] = run_id.to_string();
+    cols[idx("schema_version")] = SCHEMA_VERSION.to_string();
+    cols[idx("signal_id")] = signal_id.to_string();
+    cols[idx("signal_ts_unix_ms")] = ts_ms.to_string();
+    cols[idx("window_start_ms")] = "100".to_string();
+    cols[idx("window_end_ms")] = "1100".to_string();
+    cols[idx("market_id")] = market_id.to_string();
+    cols[idx("strategy")] = strategy.to_string();
+    cols[idx("bucket")] = bucket.to_string();
+    cols[idx("total_pnl")] = total_pnl.to_string();
+    cols[idx("set_ratio")] = set_ratio.to_string();
 
     let mut s = cols.join(",");
     s.push('\n');

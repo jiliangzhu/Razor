@@ -98,19 +98,25 @@ pub fn generate_report_files(
     thresholds: ReportThresholds,
 ) -> anyhow::Result<Report> {
     let shadow_path = data_dir.join(FILE_SHADOW_LOG);
+
+    let report = compute_report(&shadow_path, run_id, thresholds)?;
+    write_report_files(data_dir, &report)?;
+
+    Ok(report)
+}
+
+pub fn write_report_files(data_dir: &Path, report: &Report) -> anyhow::Result<()> {
     let out_json = data_dir.join(FILE_REPORT_JSON);
     let out_md = data_dir.join(FILE_REPORT_MD);
 
-    let report = compute_report(&shadow_path, run_id, thresholds)?;
-
-    let json = serde_json::to_vec_pretty(&report).context("serialize report.json")?;
+    let json = serde_json::to_vec_pretty(report).context("serialize report.json")?;
     std::fs::write(&out_json, json).with_context(|| format!("write {}", out_json.display()))?;
 
-    let md = render_report_md(&report);
+    let md = render_report_md(report);
     std::fs::write(&out_md, md.as_bytes())
         .with_context(|| format!("write {}", out_md.display()))?;
 
-    Ok(report)
+    Ok(())
 }
 
 pub fn compute_report(
@@ -225,8 +231,8 @@ pub fn compute_report(
                 total_shadow_pnl += r.total_pnl;
                 set_ratio_sum += r.set_ratio;
 
-                min_ts = Some(min_ts.map_or(r.signal_ts_unix_ms, |v| v.min(r.signal_ts_unix_ms)));
-                max_ts = Some(max_ts.map_or(r.signal_ts_unix_ms, |v| v.max(r.signal_ts_unix_ms)));
+                min_ts = Some(min_ts.map_or(r.signal_ts_ms, |v| v.min(r.signal_ts_ms)));
+                max_ts = Some(max_ts.map_or(r.signal_ts_ms, |v| v.max(r.signal_ts_ms)));
 
                 match bucket {
                     "liquid" => acc_bucket_liquid.push(r.total_pnl, r.set_ratio),
@@ -456,7 +462,7 @@ impl Accum {
 struct HeaderMeta {
     run_id: usize,
     signal_id: usize,
-    signal_ts_unix_ms: usize,
+    signal_ts_ms: usize,
     market_id: usize,
     strategy: usize,
     bucket: usize,
@@ -468,7 +474,7 @@ impl HeaderMeta {
     fn new(header: &csv::StringRecord) -> anyhow::Result<Self> {
         let run_id = find_col(header, "run_id").context("missing column: run_id")?;
         let signal_id = find_col(header, "signal_id").context("missing column: signal_id")?;
-        let signal_ts_unix_ms =
+        let signal_ts_ms =
             find_col(header, "signal_ts_unix_ms").context("missing column: signal_ts_unix_ms")?;
         let market_id = find_col(header, "market_id").context("missing column: market_id")?;
         let strategy = find_col(header, "strategy").context("missing column: strategy")?;
@@ -479,7 +485,7 @@ impl HeaderMeta {
         Ok(Self {
             run_id,
             signal_id,
-            signal_ts_unix_ms,
+            signal_ts_ms,
             market_id,
             strategy,
             bucket,
@@ -503,7 +509,7 @@ enum RowParse {
 
 struct ParsedRow {
     signal_id: u64,
-    signal_ts_unix_ms: u64,
+    signal_ts_ms: u64,
     market_id: String,
     strategy: String,
     bucket: String,
@@ -521,7 +527,7 @@ fn parse_row(record: &csv::StringRecord, meta: &HeaderMeta, run_id: &str) -> Opt
     }
 
     let signal_id = parse_u64(record.get(meta.signal_id)?)?;
-    let signal_ts_unix_ms = parse_u64(record.get(meta.signal_ts_unix_ms)?)?;
+    let signal_ts_ms = parse_u64(record.get(meta.signal_ts_ms)?)?;
 
     let market_id = record.get(meta.market_id)?.trim().to_string();
     if market_id.is_empty() {
@@ -539,7 +545,7 @@ fn parse_row(record: &csv::StringRecord, meta: &HeaderMeta, run_id: &str) -> Opt
 
     Some(RowParse::Ok(ParsedRow {
         signal_id,
-        signal_ts_unix_ms,
+        signal_ts_ms,
         market_id,
         strategy,
         bucket,

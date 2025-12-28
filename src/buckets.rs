@@ -1,5 +1,6 @@
 use crate::config::BucketConfig;
-use crate::types::{Bps, Bucket, MarketSnapshot};
+use crate::reasons::ShadowReason;
+use crate::types::{Bps, Bucket, BucketMetrics, MarketSnapshot};
 
 const INVALID_SPREAD_BPS: Bps = Bps(i32::MAX);
 
@@ -10,36 +11,79 @@ pub fn fill_share_p25(bucket: Bucket, cfg: &BucketConfig) -> f64 {
     }
 }
 
-pub fn bucket_for_snapshot(snapshot: &MarketSnapshot) -> Bucket {
-    let Some((worst, worst_depth)) = worst_leg(snapshot) else {
-        return Bucket::Thin;
+#[derive(Debug, Clone)]
+pub struct BucketDecision {
+    pub bucket: Bucket,
+    pub worst_leg_token_id: String,
+    pub metrics: BucketMetrics,
+    pub reasons: Vec<ShadowReason>,
+}
+
+pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
+    if snapshot.legs.is_empty() {
+        return BucketDecision {
+            bucket: Bucket::Thin,
+            worst_leg_token_id: String::new(),
+            metrics: BucketMetrics {
+                worst_leg_index: 0,
+                worst_spread_bps: i32::MAX,
+                worst_depth3_usdc: f64::NAN,
+                is_depth3_degraded: true,
+            },
+            reasons: vec![ShadowReason::BucketNan],
+        };
+    }
+
+    let mut is_depth3_degraded = false;
+    let mut worst_leg_index = 0usize;
+    let mut worst_depth = f64::INFINITY;
+
+    for (idx, leg) in snapshot.legs.iter().enumerate() {
+        let d = depth_sanitize(leg.ask_depth3_usdc);
+        if !leg.ask_depth3_usdc.is_finite() || leg.ask_depth3_usdc <= 0.0 {
+            is_depth3_degraded = true;
+        }
+        if d < worst_depth {
+            worst_depth = d;
+            worst_leg_index = idx;
+        }
+    }
+
+    let worst = &snapshot.legs[worst_leg_index];
+    let spread = spread_bps(worst.best_bid, worst.best_ask).raw();
+    let worst_depth3 = if is_depth3_degraded {
+        f64::NAN
+    } else {
+        worst_depth
     };
 
-    let spread_bps = spread_bps(worst.best_bid, worst.best_ask);
-
-    if spread_bps < Bps::new(20) && worst_depth > 500.0 {
+    let bucket = if !is_depth3_degraded && spread < 20 && worst_depth3 > 500.0 {
         Bucket::Liquid
     } else {
         Bucket::Thin
-    }
-}
+    };
 
-pub fn worst_leg(snapshot: &MarketSnapshot) -> Option<(&crate::types::LegSnapshot, f64)> {
-    let mut worst = snapshot.legs.first()?;
-    let mut worst_depth = depth_sanitize(worst.ask_depth3_usdc);
-    for leg in &snapshot.legs[1..] {
-        let d = depth_sanitize(leg.ask_depth3_usdc);
-        if d < worst_depth {
-            worst_depth = d;
-            worst = leg;
-        }
+    let mut reasons: Vec<ShadowReason> = Vec::new();
+    if bucket == Bucket::Thin && (is_depth3_degraded || spread == INVALID_SPREAD_BPS.raw()) {
+        reasons.push(ShadowReason::BucketNan);
     }
-    Some((worst, worst_depth))
+
+    BucketDecision {
+        bucket,
+        worst_leg_token_id: worst.token_id.clone(),
+        metrics: BucketMetrics {
+            worst_leg_index,
+            worst_spread_bps: spread,
+            worst_depth3_usdc: worst_depth3,
+            is_depth3_degraded,
+        },
+        reasons,
+    }
 }
 
 fn depth_sanitize(depth3_usdc: f64) -> f64 {
     if !depth3_usdc.is_finite() || depth3_usdc < 0.0 {
-        0.0
+        f64::INFINITY
     } else {
         depth3_usdc
     }
@@ -96,7 +140,9 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(bucket_for_snapshot(&snap), Bucket::Thin);
+        let d = classify_bucket(&snap);
+        assert_eq!(d.bucket, Bucket::Thin);
+        assert_eq!(d.metrics.worst_leg_index, 0);
     }
 
     #[test]
@@ -125,6 +171,8 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(bucket_for_snapshot(&snap), Bucket::Liquid);
+        let d = classify_bucket(&snap);
+        assert_eq!(d.bucket, Bucket::Liquid);
+        assert_eq!(d.metrics.worst_leg_index, 0);
     }
 }

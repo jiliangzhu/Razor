@@ -1,52 +1,57 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::buckets::bucket_for_snapshot;
+use crate::buckets::classify_bucket;
 use crate::config::Config;
+use crate::health::HealthCounters;
+use crate::reasons::ShadowReason;
 use crate::types::{
-    now_us, Bps, Bucket, BucketMode, Leg, MarketDef, MarketSnapshot, Side, Signal, Strategy,
+    now_ms, Bps, Bucket, BucketMetrics, Leg, MarketDef, MarketSnapshot, Side, Signal, Strategy,
 };
-
-const COOLDOWN_IMPROVE_OVERRIDE_BPS: Bps = Bps::new(20);
 
 #[derive(Clone, Copy, Debug)]
 struct LastSignalState {
     ts_ms: u64,
-    expected_net_bps: Bps,
+    _expected_net_bps: Bps,
 }
 
 #[derive(Debug)]
 enum SkipReason {
     BelowMinEdge,
-    CooldownNotImproved {
+    SuppressedDuplicate {
         remaining_ms: u64,
-        improvement_bps: Bps,
+        key_cost_bps: i32,
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct EvalMetrics {
     strategy: Strategy,
     bucket: Bucket,
-    bucket_mode: BucketMode,
     raw_cost_bps: Bps,
     raw_edge_bps: Bps,
     hard_fees_bps: Bps,
     risk_premium_bps: Bps,
     expected_net_bps: Bps,
-    ts_snapshot_us: u64,
+    bucket_metrics: BucketMetrics,
+    worst_leg_token_id: String,
+    reasons: Vec<ShadowReason>,
 }
 
 pub async fn run(
     cfg: Config,
+    run_id: String,
     markets: Vec<MarketDef>,
     mut snap_rx: watch::Receiver<Option<MarketSnapshot>>,
     signal_tx: mpsc::Sender<Signal>,
+    health: Arc<HealthCounters>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut next_signal_id: u64 = 1;
-    let mut last_by_market: HashMap<String, LastSignalState> = HashMap::new();
+    let mut last_by_key: HashMap<(String, Strategy, i32), LastSignalState> = HashMap::new();
     let cooldown_ms = cfg.brain.signal_cooldown_ms;
     let min_net_edge = Bps::new(cfg.brain.min_net_edge_bps);
 
@@ -56,7 +61,17 @@ pub async fn run(
     }
 
     loop {
-        snap_rx.changed().await?;
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+            res = snap_rx.changed() => {
+                res?;
+            }
+        }
+        if *shutdown.borrow() {
+            break;
+        }
         let Some(snap) = snap_rx.borrow().clone() else {
             continue;
         };
@@ -68,8 +83,7 @@ pub async fn run(
             continue;
         }
 
-        let ts_signal_us = now_us();
-        let ts_ms = ts_signal_us / 1_000;
+        let signal_ts_ms = now_ms();
 
         let metrics = match eval_snapshot(&cfg, &snap) {
             Ok(v) => v,
@@ -79,12 +93,16 @@ pub async fn run(
             }
         };
 
+        let rounded_cost_bps = (metrics.raw_cost_bps.raw() / 2) * 2;
+        let key = (snap.market_id.clone(), metrics.strategy, rounded_cost_bps);
+
         if let Err(reason) = should_emit(
-            ts_ms,
+            signal_ts_ms,
             metrics.expected_net_bps,
             min_net_edge,
             cooldown_ms,
-            last_by_market.get(&snap.market_id),
+            last_by_key.get(&key),
+            rounded_cost_bps,
         ) {
             match reason {
                 SkipReason::BelowMinEdge => {
@@ -95,16 +113,17 @@ pub async fn run(
                         "skip: below min net edge"
                     );
                 }
-                SkipReason::CooldownNotImproved {
+                SkipReason::SuppressedDuplicate {
                     remaining_ms,
-                    improvement_bps,
+                    key_cost_bps,
                 } => {
+                    health.inc_signals_suppressed(1);
                     debug!(
                         market_id = %snap.market_id,
                         remaining_ms,
                         expected_net_bps = metrics.expected_net_bps.raw(),
-                        improvement_bps = improvement_bps.raw(),
-                        "skip: cooldown"
+                        key_cost_bps,
+                        "skip: suppressed duplicate"
                     );
                 }
             }
@@ -112,18 +131,18 @@ pub async fn run(
         };
 
         let q_req = cfg.brain.q_req;
-        let worst_leg_token_id = crate::buckets::worst_leg(&snap)
-            .map(|(leg, _)| leg.token_id.clone())
-            .unwrap_or_default();
         let legs: Vec<Leg> = snap
             .legs
             .iter()
-            .map(|l| Leg {
+            .enumerate()
+            .map(|(idx, l)| Leg {
+                leg_index: idx,
                 token_id: l.token_id.clone(),
                 side: Side::Buy,
                 limit_price: l.best_ask,
                 qty: q_req,
-                best_bid: l.best_bid,
+                best_bid_at_signal: l.best_bid,
+                best_ask_at_signal: l.best_ask,
             })
             .collect();
 
@@ -131,52 +150,52 @@ pub async fn run(
         next_signal_id += 1;
 
         let signal = Signal {
+            run_id: run_id.clone(),
             signal_id,
-            ts_signal_us,
-            ts_ms,
-            ts_snapshot_us: metrics.ts_snapshot_us,
+            signal_ts_ms,
             market_id: snap.market_id.clone(),
             strategy: metrics.strategy,
             bucket: metrics.bucket,
-            bucket_mode: metrics.bucket_mode,
-            worst_leg_token_id,
+            reasons: metrics.reasons.clone(),
             q_req,
             raw_cost_bps: metrics.raw_cost_bps,
             raw_edge_bps: metrics.raw_edge_bps,
             hard_fees_bps: metrics.hard_fees_bps,
             risk_premium_bps: metrics.risk_premium_bps,
             expected_net_bps: metrics.expected_net_bps,
+            bucket_metrics: metrics.bucket_metrics.clone(),
             legs,
         };
 
-        last_by_market.insert(
-            snap.market_id.clone(),
+        last_by_key.insert(
+            key,
             LastSignalState {
-                ts_ms,
-                expected_net_bps: metrics.expected_net_bps,
+                ts_ms: signal_ts_ms,
+                _expected_net_bps: metrics.expected_net_bps,
             },
         );
 
         match signal_tx.try_send(signal) {
             Ok(()) => {
+                health.inc_signals_emitted(1);
                 info!(
                     signal_id,
                     market_id = %snap.market_id,
                     bucket = %metrics.bucket.as_str(),
-                    bucket_mode = %metrics.bucket_mode.as_str(),
                     strategy = %metrics.strategy.as_str(),
+                    worst_leg_token_id = %metrics.worst_leg_token_id,
                     raw_cost_bps = metrics.raw_cost_bps.raw(),
                     expected_net_bps = metrics.expected_net_bps.raw(),
+                    q_req,
                     "signal"
                 );
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(s)) => {
+                health.inc_signals_dropped(1);
                 warn!(
                     signal_id = s.signal_id,
                     market_id = %s.market_id,
                     bucket = %s.bucket.as_str(),
-                    bucket_mode = %s.bucket_mode.as_str(),
-                    ts_snapshot_us = s.ts_snapshot_us,
                     raw_cost_bps = s.raw_cost_bps.raw(),
                     raw_edge_bps = s.raw_edge_bps.raw(),
                     hard_fees_bps = s.hard_fees_bps.raw(),
@@ -190,6 +209,8 @@ pub async fn run(
             }
         }
     }
+
+    Ok(())
 }
 
 fn eval_snapshot(cfg: &Config, snap: &MarketSnapshot) -> anyhow::Result<EvalMetrics> {
@@ -199,19 +220,12 @@ fn eval_snapshot(cfg: &Config, snap: &MarketSnapshot) -> anyhow::Result<EvalMetr
         n => anyhow::bail!("unsupported legs: {n}"),
     };
 
-    let bucket = bucket_for_snapshot(snap);
-
-    let bucket_mode = if snap
-        .legs
-        .iter()
-        .all(|l| l.ask_depth3_usdc.is_finite() && l.ask_depth3_usdc > 0.0)
-    {
-        BucketMode::FullL2
-    } else {
-        BucketMode::ApproxDepth1
-    };
-
-    let ts_snapshot_us = snap.legs.iter().map(|l| l.ts_recv_us).max().unwrap_or(0);
+    let crate::buckets::BucketDecision {
+        bucket,
+        worst_leg_token_id,
+        metrics: bucket_metrics,
+        reasons,
+    } = classify_bucket(snap);
 
     let sum_ask: f64 = snap.legs.iter().map(|l| l.best_ask).sum();
     if !sum_ask.is_finite() || sum_ask < 0.0 {
@@ -230,13 +244,14 @@ fn eval_snapshot(cfg: &Config, snap: &MarketSnapshot) -> anyhow::Result<EvalMetr
     Ok(EvalMetrics {
         strategy,
         bucket,
-        bucket_mode,
         raw_cost_bps,
         raw_edge_bps,
         hard_fees_bps,
         risk_premium_bps,
         expected_net_bps,
-        ts_snapshot_us,
+        bucket_metrics,
+        worst_leg_token_id,
+        reasons,
     })
 }
 
@@ -246,6 +261,7 @@ fn should_emit(
     min_net_edge_bps: Bps,
     cooldown_ms: u64,
     prev: Option<&LastSignalState>,
+    key_cost_bps: i32,
 ) -> Result<(), SkipReason> {
     if expected_net_bps < min_net_edge_bps {
         return Err(SkipReason::BelowMinEdge);
@@ -260,14 +276,9 @@ fn should_emit(
         return Ok(());
     }
 
-    let improvement = expected_net_bps - prev.expected_net_bps;
-    if improvement >= COOLDOWN_IMPROVE_OVERRIDE_BPS {
-        return Ok(());
-    }
-
-    Err(SkipReason::CooldownNotImproved {
+    Err(SkipReason::SuppressedDuplicate {
         remaining_ms: cooldown_ms.saturating_sub(elapsed_ms),
-        improvement_bps: improvement,
+        key_cost_bps,
     })
 }
 
@@ -299,6 +310,7 @@ mod tests {
                 min_net_edge_bps: 10,
                 q_req: 10.0,
                 signal_cooldown_ms: 0,
+                max_snapshot_staleness_ms: 500,
             },
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),
@@ -341,7 +353,7 @@ mod tests {
         assert_eq!(metrics.risk_premium_bps.raw(), 80);
         // net = 300 - 210 - 80 = 10
         assert_eq!(metrics.expected_net_bps.raw(), 10);
-        assert_eq!(metrics.ts_snapshot_us, 2);
+        assert_eq!(metrics.bucket_metrics.worst_leg_index, 0);
     }
 
     #[test]
@@ -349,27 +361,37 @@ mod tests {
         let now_ms = 1_000;
         let min_edge = Bps::new(11);
         let expected = Bps::new(10);
-        assert!(should_emit(now_ms, expected, min_edge, 1_000, None).is_err());
+        assert!(should_emit(now_ms, expected, min_edge, 1_000, None, 9_700).is_err());
     }
 
     #[test]
-    fn test_cooldown_override_on_improve() {
+    fn test_duplicate_suppressed_within_cooldown() {
         let prev = LastSignalState {
             ts_ms: 1_000,
-            expected_net_bps: Bps::new(50),
+            _expected_net_bps: Bps::new(50),
         };
         let now_ms = 1_500; // within cooldown=1_000 (elapsed 500)
         let min_edge = Bps::new(-10_000);
         let cooldown_ms = 1_000;
 
-        // Improve by 19 bps => still blocked.
-        let expected = Bps::new(69);
-        let err = should_emit(now_ms, expected, min_edge, cooldown_ms, Some(&prev)).unwrap_err();
-        assert!(matches!(err, SkipReason::CooldownNotImproved { .. }));
+        let expected = Bps::new(10);
+        let err =
+            should_emit(now_ms, expected, min_edge, cooldown_ms, Some(&prev), 9_700).unwrap_err();
+        assert!(matches!(err, SkipReason::SuppressedDuplicate { .. }));
+    }
 
-        // Improve by 20 bps => override.
-        let expected = Bps::new(70);
-        assert!(should_emit(now_ms, expected, min_edge, cooldown_ms, Some(&prev)).is_ok());
+    #[test]
+    fn test_emit_after_cooldown() {
+        let prev = LastSignalState {
+            ts_ms: 1_000,
+            _expected_net_bps: Bps::new(50),
+        };
+        let now_ms = 2_100; // elapsed 1100 >= cooldown 1000
+        let min_edge = Bps::new(-10_000);
+        let cooldown_ms = 1_000;
+
+        let expected = Bps::new(10);
+        assert!(should_emit(now_ms, expected, min_edge, cooldown_ms, Some(&prev), 9_700).is_ok());
     }
 
     #[test]
@@ -386,6 +408,7 @@ mod tests {
                 min_net_edge_bps: 10,
                 q_req: 10.0,
                 signal_cooldown_ms: 0,
+                max_snapshot_staleness_ms: 500,
             },
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),

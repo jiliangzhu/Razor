@@ -10,6 +10,8 @@ use std::fmt;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::reasons::ShadowReason;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Bps(pub i32);
 
@@ -174,7 +176,7 @@ impl SubAssign for Bps {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Strategy {
     Binary,
     Triangle,
@@ -206,27 +208,14 @@ impl LiquidityBucket {
 
 pub type Bucket = LiquidityBucket;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BucketMode {
-    FullL2,
-    ApproxDepth1,
-}
-
-impl BucketMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BucketMode::FullL2 => "full_l2",
-            BucketMode::ApproxDepth1 => "approx_depth1",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct LegSnapshot {
     pub token_id: String,
     pub best_ask: f64,
+    #[allow(dead_code)]
     pub best_ask_size_best: f64,
     pub best_bid: f64,
+    #[allow(dead_code)]
     pub best_bid_size_best: f64,
     pub ask_depth3_usdc: f64,
     #[allow(dead_code)]
@@ -239,6 +228,7 @@ pub struct MarketSnapshot {
     pub legs: Vec<LegSnapshot>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum Side {
     Buy,
@@ -246,6 +236,7 @@ pub enum Side {
 }
 
 impl Side {
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Side::Buy => "BUY",
@@ -255,36 +246,40 @@ impl Side {
 }
 
 #[derive(Clone, Debug)]
-pub struct OrderLeg {
+pub struct SignalLeg {
+    pub leg_index: usize,
     pub token_id: String,
+    #[allow(dead_code)]
     pub side: Side,
     pub limit_price: f64,
     pub qty: f64,
-    pub best_bid: f64,
+    pub best_bid_at_signal: f64,
+    #[allow(dead_code)]
+    pub best_ask_at_signal: f64,
 }
 
-pub type Leg = OrderLeg;
+pub type Leg = SignalLeg;
 
 #[derive(Clone, Debug)]
 pub struct Signal {
+    pub run_id: String,
     pub signal_id: u64,
-    pub ts_signal_us: u64,
-    pub ts_ms: u64,
-    pub ts_snapshot_us: u64,
+    pub signal_ts_ms: u64,
     pub market_id: String,
     pub strategy: Strategy,
     pub bucket: Bucket,
-    pub bucket_mode: BucketMode,
-    pub worst_leg_token_id: String,
+    pub reasons: Vec<ShadowReason>,
     pub q_req: f64,
     pub raw_cost_bps: Bps,
     pub raw_edge_bps: Bps,
     pub hard_fees_bps: Bps,
     pub risk_premium_bps: Bps,
     pub expected_net_bps: Bps,
-    pub legs: Vec<OrderLeg>,
+    pub bucket_metrics: BucketMetrics,
+    pub legs: Vec<SignalLeg>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillStatus {
     None,
@@ -293,6 +288,7 @@ pub enum FillStatus {
 }
 
 impl FillStatus {
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             FillStatus::None => "NONE",
@@ -302,6 +298,7 @@ impl FillStatus {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FillReport {
     pub requested_qty: f64,
@@ -312,11 +309,32 @@ pub struct FillReport {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeTick {
+    /// Phase 1 canonical timestamp (unix ms) used for shadow windows.
+    ///
+    /// Current policy: `ts_ms` is **local ingest time** (TS_SRC=local).
     pub ts_ms: u64,
+    /// Local ingest timestamp (unix ms). Redundant with `ts_ms` when TS_SRC=local.
+    #[serde(default)]
+    pub ingest_ts_ms: u64,
+    /// Exchange timestamp (unix ms) if available; None when missing/unknown.
+    #[serde(default)]
+    pub exchange_ts_ms: Option<u64>,
     pub market_id: String,
     pub token_id: String,
     pub price: f64,
     pub size: f64,
+    pub trade_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BucketMetrics {
+    pub worst_leg_index: usize,
+    #[allow(dead_code)]
+    pub worst_spread_bps: i32,
+    #[allow(dead_code)]
+    pub worst_depth3_usdc: f64,
+    #[allow(dead_code)]
+    pub is_depth3_degraded: bool,
 }
 
 #[derive(Clone, Debug)]

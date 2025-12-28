@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
+use serde::Serialize;
 use tracing::warn;
 
-pub const TRADES_HEADER: [&str; 5] = ["ts_ms", "market_id", "token_id", "price", "size"];
+pub const TRADES_HEADER: [&str; 8] = crate::schema::TRADES_HEADER;
 
 pub const TICKS_HEADER: [&str; 6] = [
     "ts_recv_us",
@@ -93,10 +94,66 @@ impl CsvAppender {
         self.writer.flush()?;
         Ok(())
     }
+
+    pub fn flush_and_sync(&mut self) -> anyhow::Result<()> {
+        self.writer.flush()?;
+        self.writer
+            .get_ref()
+            .get_ref()
+            .sync_all()
+            .context("sync csv file")?;
+        Ok(())
+    }
 }
 
 pub struct JsonlAppender {
     out: BufWriter<File>,
+}
+
+pub struct RecorderGuard {
+    run_dir: PathBuf,
+}
+
+impl RecorderGuard {
+    pub fn new(run_dir: PathBuf) -> Self {
+        Self { run_dir }
+    }
+
+    pub fn flush_all(&self) -> anyhow::Result<()> {
+        let files = [
+            crate::schema::FILE_TICKS,
+            crate::schema::FILE_TRADES,
+            crate::schema::FILE_SHADOW_LOG,
+            crate::schema::FILE_RAW_WS_JSONL,
+            crate::schema::FILE_HEALTH_JSONL,
+            crate::schema::FILE_REPORT_JSON,
+            crate::schema::FILE_REPORT_MD,
+            crate::schema::FILE_SCHEMA_VERSION,
+            crate::schema::FILE_RUN_CONFIG,
+            crate::schema::FILE_RUN_META_JSON,
+        ];
+
+        for f in files {
+            let path = self.run_dir.join(f);
+            if !path.exists() {
+                continue;
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .with_context(|| format!("open {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync {}", path.display()))?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for RecorderGuard {
+    fn drop(&mut self) {
+        let _ = self.flush_all();
+    }
 }
 
 fn schema_mismatch_backup_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -130,5 +187,91 @@ impl JsonlAppender {
         self.out.write_all(b"\n")?;
         self.out.flush()?;
         Ok(())
+    }
+
+    pub fn flush_and_sync(&mut self) -> anyhow::Result<()> {
+        self.out.flush()?;
+        self.out.get_ref().sync_all().context("sync jsonl file")?;
+        Ok(())
+    }
+}
+
+pub fn write_run_config_snapshot(run_dir: &Path, cfg_raw: &str) -> anyhow::Result<()> {
+    let out_path = run_dir.join(crate::schema::FILE_RUN_CONFIG);
+    std::fs::write(&out_path, cfg_raw.as_bytes())
+        .with_context(|| format!("write {}", out_path.display()))?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct RunMeta {
+    run_id: String,
+    start_ts_ms: u64,
+    schema_version: String,
+    binary_version: String,
+    mode: String,
+    pid: u32,
+    host: String,
+    os: String,
+    arch: String,
+    git_commit: String,
+}
+
+pub fn write_run_meta_json(
+    run_dir: &Path,
+    run_id: &str,
+    start_ts_ms: u64,
+    mode: &impl std::fmt::Display,
+) -> anyhow::Result<()> {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let meta = RunMeta {
+        run_id: run_id.to_string(),
+        start_ts_ms,
+        schema_version: crate::schema::SCHEMA_VERSION.to_string(),
+        binary_version: env!("CARGO_PKG_VERSION").to_string(),
+        mode: mode.to_string(),
+        pid: std::process::id(),
+        host,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        git_commit: read_git_commit().unwrap_or_else(|| "unknown".to_string()),
+    };
+
+    let out_path = run_dir.join(crate::schema::FILE_META_JSON);
+    let json = serde_json::to_vec_pretty(&meta).context("serialize meta.json")?;
+    std::fs::write(&out_path, json).with_context(|| format!("write {}", out_path.display()))?;
+    Ok(())
+}
+
+fn read_git_commit() -> Option<String> {
+    let head = std::fs::read_to_string(".git/HEAD").ok()?;
+    let head = head.trim();
+
+    if let Some(rest) = head.strip_prefix("ref:") {
+        let reference = rest.trim();
+        let ref_path = Path::new(".git").join(reference);
+        if let Ok(commit) = std::fs::read_to_string(&ref_path) {
+            return Some(commit.trim().to_string());
+        }
+        // Fallback: packed-refs (best-effort).
+        let packed = std::fs::read_to_string(".git/packed-refs").ok()?;
+        for line in packed.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let commit = parts.next()?;
+            let r = parts.next()?;
+            if r == reference {
+                return Some(commit.to_string());
+            }
+        }
+        None
+    } else {
+        Some(head.to_string())
     }
 }

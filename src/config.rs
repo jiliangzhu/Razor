@@ -1,7 +1,5 @@
-use std::path::{Path, PathBuf};
-
-use anyhow::Context as _;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -18,23 +16,15 @@ pub struct Config {
     pub shadow: ShadowConfig,
     #[serde(default)]
     pub report: ReportConfig,
+    #[allow(dead_code)]
     #[serde(default)]
     pub live: LiveConfig,
+    #[allow(dead_code)]
     #[serde(default)]
     pub calibration: CalibrationConfig,
+    #[allow(dead_code)]
     #[serde(default)]
     pub sim: SimConfig,
-}
-
-impl Config {
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-        Ok(cfg)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -94,6 +84,9 @@ pub struct BrainConfig {
     pub q_req: f64,
     #[serde(default = "default_signal_cooldown_ms")]
     pub signal_cooldown_ms: u64,
+    #[allow(dead_code)]
+    #[serde(default = "default_max_snapshot_staleness_ms")]
+    pub max_snapshot_staleness_ms: u64,
 }
 
 impl Default for BrainConfig {
@@ -103,6 +96,7 @@ impl Default for BrainConfig {
             min_net_edge_bps: default_min_net_edge_bps(),
             q_req: default_q_req(),
             signal_cooldown_ms: default_signal_cooldown_ms(),
+            max_snapshot_staleness_ms: default_max_snapshot_staleness_ms(),
         }
     }
 }
@@ -121,6 +115,10 @@ fn default_q_req() -> f64 {
 
 fn default_signal_cooldown_ms() -> u64 {
     1000
+}
+
+fn default_max_snapshot_staleness_ms() -> u64 {
+    500
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -160,6 +158,11 @@ pub struct ShadowConfig {
     pub trade_poll_limit: usize,
     #[serde(default = "default_trade_retention_ms")]
     pub trade_retention_ms: u64,
+    #[serde(default = "default_shadow_max_trades")]
+    pub max_trades: usize,
+    #[allow(dead_code)]
+    #[serde(default = "default_shadow_max_trade_gap_ms")]
+    pub max_trade_gap_ms: u64,
 }
 
 impl Default for ShadowConfig {
@@ -170,6 +173,8 @@ impl Default for ShadowConfig {
             trade_poll_interval_ms: default_trade_poll_interval_ms(),
             trade_poll_limit: default_trade_poll_limit(),
             trade_retention_ms: default_trade_retention_ms(),
+            max_trades: default_shadow_max_trades(),
+            max_trade_gap_ms: default_shadow_max_trade_gap_ms(),
         }
     }
 }
@@ -192,6 +197,14 @@ fn default_trade_poll_limit() -> usize {
 
 fn default_trade_retention_ms() -> u64 {
     5000
+}
+
+fn default_shadow_max_trades() -> usize {
+    200_000
+}
+
+fn default_shadow_max_trade_gap_ms() -> u64 {
+    700
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -219,6 +232,7 @@ fn default_report_min_avg_set_ratio() -> f64 {
     0.85
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct LiveConfig {
     #[serde(default)]
@@ -282,6 +296,7 @@ fn default_live_cooldown_ms() -> u64 {
     1000
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct CalibrationConfig {
     #[serde(default = "default_calibration_min_samples_per_bucket")]
@@ -314,6 +329,7 @@ fn default_calibration_quantile() -> f64 {
     0.25
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct SimConfig {
     #[serde(default = "default_sim_fill_share_liquid")]

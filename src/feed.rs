@@ -5,11 +5,13 @@ use std::time::Duration;
 use anyhow::Context as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::Deserialize;
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::health::{HealthCounters, HealthLine};
 use crate::recorder::{CsvAppender, JsonlAppender, TICKS_HEADER, TRADES_HEADER};
 use crate::types::{now_ms, now_us, LegSnapshot, MarketDef, MarketSnapshot, TradeTick};
 
@@ -92,6 +94,8 @@ pub async fn run_market_ws(
     snap_tx: watch::Sender<Option<MarketSnapshot>>,
     ticks_path: PathBuf,
     raw_ws_path: PathBuf,
+    health: Arc<HealthCounters>,
+    shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut ticks = CsvAppender::open(ticks_path, &TICKS_HEADER).context("open ticks.csv")?;
     let mut raw = JsonlAppender::open(raw_ws_path).context("open raw_ws.jsonl")?;
@@ -137,6 +141,9 @@ pub async fn run_market_ws(
 
     let mut backoff = Duration::from_secs(1);
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         match ws_run_once(
             &ws_url,
             &subscribe_tokens,
@@ -145,6 +152,8 @@ pub async fn run_market_ws(
             &mut ticks,
             &mut raw,
             &snap_tx,
+            &health,
+            shutdown.clone(),
         )
         .await
         {
@@ -158,8 +167,13 @@ pub async fn run_market_ws(
             }
         }
     }
+
+    ticks.flush_and_sync().context("flush ticks.csv")?;
+    raw.flush_and_sync().context("flush raw_ws.jsonl")?;
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ws_run_once(
     ws_url: &str,
     subscribe_tokens: &[String],
@@ -168,8 +182,13 @@ async fn ws_run_once(
     ticks: &mut CsvAppender,
     raw: &mut JsonlAppender,
     snap_tx: &watch::Sender<Option<MarketSnapshot>>,
+    health: &HealthCounters,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     info!(%ws_url, tokens = subscribe_tokens.len(), "connecting ws");
+    if *shutdown.borrow() {
+        return Ok(());
+    }
     let (ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .context("connect ws")?;
@@ -189,6 +208,11 @@ async fn ws_run_once(
 
     loop {
         tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
             _ = ping.tick() => {
                 sink.send(Message::Text("PING".to_string().into()))
                     .await
@@ -201,11 +225,11 @@ async fn ws_run_once(
                 let msg = msg.context("ws read")?;
                 match msg {
                     Message::Text(txt) => {
-                        handle_ws_text(&txt, token_to_market, market_states, ticks, raw, snap_tx).await?;
+                        handle_ws_text(&txt, token_to_market, market_states, ticks, raw, snap_tx, health).await?;
                     }
                     Message::Binary(bin) => {
                         let txt = String::from_utf8_lossy(&bin);
-                        handle_ws_text(&txt, token_to_market, market_states, ticks, raw, snap_tx).await?;
+                        handle_ws_text(&txt, token_to_market, market_states, ticks, raw, snap_tx, health).await?;
                     }
                     Message::Ping(_) | Message::Pong(_) => {}
                     Message::Close(frame) => {
@@ -225,6 +249,7 @@ async fn handle_ws_text(
     ticks: &mut CsvAppender,
     raw: &mut JsonlAppender,
     snap_tx: &watch::Sender<Option<MarketSnapshot>>,
+    health: &HealthCounters,
 ) -> anyhow::Result<()> {
     if txt == "PONG" {
         return Ok(());
@@ -246,12 +271,12 @@ async fn handle_ws_text(
         serde_json::Value::Array(items) => {
             for item in items {
                 if let serde_json::Value::Object(obj) = item {
-                    handle_ws_obj(obj, token_to_market, market_states, ticks, snap_tx)?;
+                    handle_ws_obj(obj, token_to_market, market_states, ticks, snap_tx, health)?;
                 }
             }
         }
         serde_json::Value::Object(obj) => {
-            handle_ws_obj(obj, token_to_market, market_states, ticks, snap_tx)?;
+            handle_ws_obj(obj, token_to_market, market_states, ticks, snap_tx, health)?;
         }
         _ => {}
     }
@@ -265,6 +290,7 @@ fn handle_ws_obj(
     market_states: &mut HashMap<String, MarketState>,
     ticks: &mut CsvAppender,
     snap_tx: &watch::Sender<Option<MarketSnapshot>>,
+    health: &HealthCounters,
 ) -> anyhow::Result<()> {
     let Some(event_type) = obj.get("event_type").and_then(|v| v.as_str()) else {
         return Ok(());
@@ -314,6 +340,8 @@ fn handle_ws_obj(
         best_ask.to_string(),
         ask_depth3_usdc.to_string(),
     ])?;
+    health.inc_ticks_processed(1);
+    health.set_last_tick_ingest_ms(ts_recv_us / 1000);
 
     let Some(state) = market_states.get_mut(market_id) else {
         return Ok(());
@@ -451,6 +479,9 @@ pub async fn run_trades_poller(
     markets: Vec<MarketDef>,
     trade_tx: mpsc::Sender<TradeTick>,
     trades_path: PathBuf,
+    health: Arc<HealthCounters>,
+    health_tx: mpsc::Sender<HealthLine>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut trades = CsvAppender::open(trades_path, &TRADES_HEADER).context("open trades.csv")?;
 
@@ -477,12 +508,27 @@ pub async fn run_trades_poller(
     );
     let mut last_ts: u64 = 0;
     let mut seen_at_last_ts: HashSet<String> = HashSet::new();
+    let mut recent_ids: HashSet<String> = HashSet::new();
+    let mut recent_queue: std::collections::VecDeque<(u64, String)> =
+        std::collections::VecDeque::new();
+    let mut last_drop_log_ms: u64 = 0;
+    let mut dropped_trades: u64 = 0;
 
     let mut interval =
         tokio::time::interval(Duration::from_millis(cfg.shadow.trade_poll_interval_ms));
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {}
+        }
+        if *shutdown.borrow() {
+            break;
+        }
 
         let resp = match client
             .get(&url)
@@ -508,6 +554,33 @@ pub async fn run_trades_poller(
                 continue;
             }
         };
+
+        let returned_count = list.len();
+        if returned_count >= cfg.shadow.trade_poll_limit {
+            health.inc_trade_poll_hit_limit(1);
+            let mut earliest = u64::MAX;
+            let mut latest = 0u64;
+            for t in &list {
+                let ts_ms = normalize_ts_ms(t.timestamp);
+                earliest = earliest.min(ts_ms);
+                latest = latest.max(ts_ms);
+            }
+            warn!(
+                returned_count,
+                limit = cfg.shadow.trade_poll_limit,
+                earliest_ts_ms = earliest,
+                latest_ts_ms = latest,
+                "data-api trades poll hit limit; may be missing trades"
+            );
+            let _ = health_tx
+                .try_send(HealthLine::TradePollHitLimit {
+                    ts_ms: now_ms(),
+                    returned_count,
+                    earliest_ts_ms: earliest,
+                    latest_ts_ms: latest,
+                })
+                .map_err(|_| ());
+        }
 
         let mut list = list;
         list.sort_by(|a, b| {
@@ -548,13 +621,42 @@ pub async fn run_trades_poller(
                 continue;
             }
 
-            let ts_ms = now_ms();
+            let now = now_ms();
+            expire_recent_ids(
+                now,
+                cfg.shadow.trade_retention_ms,
+                &mut recent_queue,
+                &mut recent_ids,
+            );
+
+            let trade_ts_ms = normalize_ts_ms(t.timestamp);
+            let trade_id = dedup_key(
+                &t.market_id,
+                &t.asset_id,
+                trade_ts_ms,
+                t.price,
+                t.size,
+                &t.transaction_hash,
+            );
+            if recent_ids.contains(&trade_id) {
+                health.inc_trades_duplicated(1);
+                continue;
+            }
+            recent_ids.insert(trade_id.clone());
+            recent_queue.push_back((now, trade_id.clone()));
+
+            // Phase 1 uses local ingest time as the canonical timestamp domain for shadow windows.
+            let ingest_ts_ms = now;
+            let ts_ms = ingest_ts_ms;
             let tick = TradeTick {
                 ts_ms,
+                ingest_ts_ms,
+                exchange_ts_ms: Some(trade_ts_ms),
                 market_id: t.market_id.clone(),
                 token_id: t.asset_id.clone(),
                 price: t.price,
                 size: t.size,
+                trade_id: trade_id.clone(),
             };
 
             trades.write_record([
@@ -563,10 +665,31 @@ pub async fn run_trades_poller(
                 tick.token_id.clone(),
                 tick.price.to_string(),
                 tick.size.to_string(),
+                tick.trade_id.clone(),
+                tick.ingest_ts_ms.to_string(),
+                tick.exchange_ts_ms
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
             ])?;
+            health.inc_trades_written(1);
+            health.set_last_trade_ingest_ms(tick.ingest_ts_ms);
 
-            if trade_tx.send(tick).await.is_err() {
-                return Err(anyhow::anyhow!("trade receiver dropped"));
+            match trade_tx.try_send(tick) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    health.inc_trades_dropped(1);
+                    dropped_trades = dropped_trades.saturating_add(1);
+                    if now.saturating_sub(last_drop_log_ms) >= 10_000 {
+                        last_drop_log_ms = now;
+                        warn!(
+                            dropped_trades,
+                            "trade channel full; dropping trades (Phase1 allows drop)"
+                        );
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(anyhow::anyhow!("trade receiver dropped"));
+                }
             }
 
             if t.timestamp > max_ts {
@@ -583,6 +706,57 @@ pub async fn run_trades_poller(
             seen_at_last_ts = hashes_at_max_ts;
         } else if max_ts == last_ts && !hashes_at_max_ts.is_empty() {
             seen_at_last_ts.extend(hashes_at_max_ts);
+        }
+    }
+
+    trades.flush_and_sync().context("flush trades.csv")?;
+    Ok(())
+}
+
+fn normalize_ts_ms(ts: u64) -> u64 {
+    // If the API gives seconds, normalize to ms.
+    if ts < 1_000_000_000_000 {
+        ts.saturating_mul(1000)
+    } else {
+        ts
+    }
+}
+
+fn dedup_key(
+    market_id: &str,
+    token_id: &str,
+    ts_ms: u64,
+    price: f64,
+    size: f64,
+    transaction_hash: &str,
+) -> String {
+    if !transaction_hash.trim().is_empty() {
+        transaction_hash.trim().to_string()
+    } else {
+        format!(
+            "weak:{market_id}:{token_id}:{ts_ms}:{:016x}:{:016x}",
+            price.to_bits(),
+            size.to_bits()
+        )
+    }
+}
+
+fn expire_recent_ids(
+    now_ms: u64,
+    retention_ms: u64,
+    q: &mut std::collections::VecDeque<(u64, String)>,
+    set: &mut HashSet<String>,
+) {
+    if retention_ms == 0 {
+        q.clear();
+        set.clear();
+        return;
+    }
+
+    let cutoff = now_ms.saturating_sub(retention_ms);
+    while q.front().is_some_and(|(ts, _)| *ts < cutoff) {
+        if let Some((_, id)) = q.pop_front() {
+            set.remove(&id);
         }
     }
 }
