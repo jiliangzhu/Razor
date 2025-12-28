@@ -21,6 +21,7 @@ pub struct WindowStats {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct DedupEvent {
     market_id: String,
     ts_ms: u64,
@@ -75,6 +76,7 @@ impl TradeStore {
         }
     }
 
+    #[allow(dead_code)]
     pub fn dedup_hits_in_window(&self, market_id: &str, start_ms: u64, end_ms: u64) -> usize {
         if market_id.trim().is_empty() || start_ms > end_ms {
             return 0;

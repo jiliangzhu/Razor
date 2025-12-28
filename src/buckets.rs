@@ -1,5 +1,5 @@
 use crate::config::BucketConfig;
-use crate::reasons::ShadowReason;
+use crate::reasons::ShadowNoteReason;
 use crate::types::{Bps, Bucket, BucketMetrics, MarketSnapshot};
 
 const INVALID_SPREAD_BPS: Bps = Bps(i32::MAX);
@@ -16,7 +16,7 @@ pub struct BucketDecision {
     pub bucket: Bucket,
     pub worst_leg_token_id: String,
     pub metrics: BucketMetrics,
-    pub reasons: Vec<ShadowReason>,
+    pub reasons: Vec<ShadowNoteReason>,
 }
 
 pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
@@ -30,7 +30,7 @@ pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
                 worst_depth3_usdc: f64::NAN,
                 is_depth3_degraded: true,
             },
-            reasons: vec![ShadowReason::BucketNan],
+            reasons: vec![ShadowNoteReason::BucketThinNan],
         };
     }
 
@@ -63,14 +63,18 @@ pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
         Bucket::Thin
     };
 
-    let mut reasons: Vec<ShadowReason> = Vec::new();
+    let mut reasons: Vec<ShadowNoteReason> = Vec::new();
     if bucket == Bucket::Thin && (is_depth3_degraded || spread == INVALID_SPREAD_BPS.raw()) {
-        reasons.push(ShadowReason::BucketNan);
+        reasons.push(ShadowNoteReason::BucketThinNan);
     }
 
     BucketDecision {
         bucket,
-        worst_leg_token_id: worst.token_id.clone(),
+        worst_leg_token_id: if is_depth3_degraded || spread == INVALID_SPREAD_BPS.raw() {
+            String::new()
+        } else {
+            worst.token_id.clone()
+        },
         metrics: BucketMetrics {
             worst_leg_index,
             worst_spread_bps: spread,

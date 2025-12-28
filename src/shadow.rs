@@ -9,9 +9,9 @@ use tracing::{debug, info};
 use crate::buckets::fill_share_p25;
 use crate::config::Config;
 use crate::health::HealthCounters;
-use crate::reasons::{format_notes, ShadowReason};
+use crate::reasons::{format_notes, ShadowNoteReason};
 use crate::recorder::{CsvAppender, SHADOW_HEADER};
-use crate::schema::DUMP_SLIPPAGE_ASSUMED;
+use crate::schema::{DUMP_SLIPPAGE_ASSUMED, SCHEMA_VERSION};
 use crate::trade_store::TradeStore;
 use crate::types::{now_ms, Bps, Leg, MarketDef, Side, Signal, TradeTick};
 
@@ -33,6 +33,7 @@ pub async fn run(
 
     let mut store = TradeStore::new_with_cap(cfg.shadow.trade_retention_ms, cfg.shadow.max_trades);
     let mut pending: Vec<Signal> = Vec::new();
+    let mut last_written_signal_id: u64 = 0;
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
@@ -46,6 +47,7 @@ pub async fn run(
                         &mut out,
                         &store,
                         &mut pending,
+                        &mut last_written_signal_id,
                         now,
                         window_start_ms,
                         window_end_ms,
@@ -77,6 +79,7 @@ pub async fn run(
                     &mut out,
                     &store,
                     &mut pending,
+                    &mut last_written_signal_id,
                     now,
                     window_start_ms,
                     window_end_ms,
@@ -96,6 +99,7 @@ fn settle_ready(
     out: &mut CsvAppender,
     store: &TradeStore,
     pending: &mut Vec<Signal>,
+    last_written_signal_id: &mut u64,
     now_ms: u64,
     window_start_ms: u64,
     window_end_ms: u64,
@@ -106,16 +110,91 @@ fn settle_ready(
     }
 
     let mut still_pending = Vec::with_capacity(pending.len());
-    for s in pending.drain(..) {
+    for mut s in pending.drain(..) {
         if now_ms < s.signal_ts_ms + window_end_ms {
             still_pending.push(s);
             continue;
         }
-        settle_one(cfg, out, store, &s, window_start_ms, window_end_ms)?;
+
+        let is_dup = s.signal_id <= *last_written_signal_id;
+        if is_dup {
+            s.reasons.push(ShadowNoteReason::DedupHit);
+        }
+
+        if let Err(e) = settle_one(cfg, out, store, &s, window_start_ms, window_end_ms) {
+            tracing::warn!(signal_id = s.signal_id, market_id = %s.market_id, error = %e, "shadow settle error");
+            write_internal_error_row(cfg, out, &s, window_start_ms, window_end_ms)?;
+        } else if !is_dup {
+            *last_written_signal_id = s.signal_id;
+        }
+
         health.set_last_shadow_write_ms(now_ms);
         health.inc_shadow_processed(1);
     }
     *pending = still_pending;
+    Ok(())
+}
+
+fn write_internal_error_row(
+    cfg: &Config,
+    out: &mut CsvAppender,
+    s: &Signal,
+    window_start_ms: u64,
+    window_end_ms: u64,
+) -> anyhow::Result<()> {
+    let legs_n = s.legs.len();
+    let mut legs_sorted = s.legs.clone();
+    legs_sorted.sort_by_key(|l| l.leg_index);
+    while legs_sorted.len() < 3 {
+        legs_sorted.push(Leg {
+            leg_index: legs_sorted.len(),
+            token_id: String::new(),
+            side: Side::Buy,
+            limit_price: 0.0,
+            qty: 0.0,
+            best_bid_at_signal: 0.0,
+            best_ask_at_signal: 0.0,
+        });
+    }
+
+    let notes = format_notes(&[ShadowNoteReason::InternalError]);
+
+    let mut record: Vec<String> = Vec::with_capacity(SHADOW_HEADER.len());
+    record.push(s.run_id.clone());
+    record.push(SCHEMA_VERSION.to_string());
+    record.push(s.signal_id.to_string());
+    record.push(s.signal_ts_ms.to_string());
+    record.push(window_start_ms.to_string());
+    record.push(window_end_ms.to_string());
+    record.push(s.market_id.clone());
+    record.push(s.strategy.as_str().to_string());
+    record.push(s.bucket.as_str().to_ascii_lowercase());
+    record.push(String::new()); // worst_leg_token_id
+    record.push(s.q_req.to_string());
+    record.push((legs_n as u8).to_string());
+    record.push("0".to_string()); // q_set
+
+    for leg in legs_sorted.iter().take(3) {
+        record.push(leg.token_id.clone());
+        record.push(leg.limit_price.to_string());
+        record.push(leg.best_bid_at_signal.to_string());
+        record.push("0".to_string()); // v_mkt
+        record.push("0".to_string()); // q_fill
+    }
+
+    record.push("0".to_string()); // cost_set
+    record.push("0".to_string()); // proceeds_set
+    record.push("0".to_string()); // pnl_set
+    record.push("0".to_string()); // pnl_left_total
+    record.push("0".to_string()); // total_pnl
+    record.push("0".to_string()); // q_fill_avg
+    record.push("0".to_string()); // set_ratio
+    record.push(fill_share_p25(s.bucket, &cfg.buckets).to_string());
+    record.push(DUMP_SLIPPAGE_ASSUMED.to_string());
+    record.push(notes);
+    debug_assert_eq!(record.len(), SHADOW_HEADER.len());
+
+    out.write_record(record)?;
     Ok(())
 }
 
@@ -139,7 +218,7 @@ fn settle_one(
     let mut legs_sorted = s.legs.clone();
     legs_sorted.sort_by_key(|l| l.leg_index);
 
-    let mut reasons: Vec<ShadowReason> = s.reasons.clone();
+    let mut reasons: Vec<ShadowNoteReason> = s.reasons.clone();
 
     let mut v_mkt: Vec<f64> = vec![0.0; legs_n.min(3)];
     let mut q_fill: Vec<f64> = vec![0.0; legs_n.min(3)];
@@ -212,10 +291,15 @@ fn settle_one(
 
     let mut pnl_left_total = 0.0f64;
     let mut bid_missing_legs: Vec<usize> = Vec::new();
+    let mut book_missing_legs: Vec<usize> = Vec::new();
     for (i, l) in legs.iter().take(legs_n.min(3)).enumerate() {
         let bid_missing = !l.best_bid_at_signal.is_finite() || l.best_bid_at_signal <= 0.0;
         if bid_missing {
             bid_missing_legs.push(i);
+            let ask_missing = !l.best_ask_at_signal.is_finite() || l.best_ask_at_signal <= 0.0;
+            if ask_missing {
+                book_missing_legs.push(i);
+            }
         }
         let exit_price = if bid_missing {
             0.0
@@ -235,12 +319,12 @@ fn settle_one(
         0.0
     };
 
-    if legs_n < 3 {
-        reasons.push(ShadowReason::LegsPadded);
+    if legs_n != 2 && legs_n != 3 {
+        reasons.push(ShadowNoteReason::LegsMismatch);
     }
 
     if !s.q_req.is_finite() || s.q_req <= 0.0 {
-        reasons.push(ShadowReason::InvalidQty);
+        reasons.push(ShadowNoteReason::InvalidQty);
     }
 
     if legs
@@ -248,55 +332,68 @@ fn settle_one(
         .take(legs_n.min(3))
         .any(|l| !l.qty.is_finite() || l.qty <= 0.0)
     {
-        reasons.push(ShadowReason::InvalidQty);
+        reasons.push(ShadowNoteReason::InvalidQty);
     }
 
     if !bid_missing_legs.is_empty() {
-        reasons.push(ShadowReason::MissingBid);
+        reasons.push(ShadowNoteReason::MissingBid);
+    }
+
+    if !book_missing_legs.is_empty() {
+        reasons.push(ShadowNoteReason::MissingBook);
     }
 
     if invalid_limit {
-        reasons.push(ShadowReason::InvalidPrice);
+        reasons.push(ShadowNoteReason::InvalidPrice);
     }
 
     let v_mkt_sum: f64 = v_mkt.iter().copied().sum();
     if window_stats.trades_in_window == 0 {
-        reasons.push(ShadowReason::WindowEmpty);
+        reasons.push(ShadowNoteReason::WindowEmpty);
     }
 
     if v_mkt_sum <= 0.0 {
-        reasons.push(ShadowReason::NoTrades);
+        reasons.push(ShadowNoteReason::NoTrades);
     }
 
-    if store.dedup_hits_in_window(&s.market_id, start_ms, end_ms) > 0 {
-        reasons.push(ShadowReason::DedupHit);
+    if fill_share_used <= 0.0 || !fill_share_used.is_finite() {
+        reasons.push(ShadowNoteReason::FillShareP25Zero);
     }
 
-    let mut worst_leg_token_id = legs
-        .iter()
-        .find(|l| l.leg_index == s.bucket_metrics.worst_leg_index)
-        .map(|l| l.token_id.clone())
-        .unwrap_or_default();
-
-    if reasons.iter().any(|r| matches!(r, ShadowReason::BucketNan)) {
-        worst_leg_token_id.clear();
+    if now_ms().saturating_sub(s.signal_ts_ms) > cfg.shadow.trade_retention_ms {
+        reasons.push(ShadowNoteReason::SignalTooOld);
     }
+
+    let bucket_nan = reasons.iter().any(|r| {
+        matches!(
+            r,
+            ShadowNoteReason::BucketThinNan | ShadowNoteReason::BucketLiquidNan
+        )
+    });
+
+    let worst_leg_token_id = if bucket_nan {
+        String::new()
+    } else {
+        legs.iter()
+            .find(|l| l.leg_index == s.bucket_metrics.worst_leg_index)
+            .map(|l| l.token_id.clone())
+            .unwrap_or_default()
+    };
 
     if worst_leg_token_id.is_empty() {
-        reasons.push(ShadowReason::BucketNan);
+        match s.bucket {
+            crate::types::LiquidityBucket::Liquid => {
+                reasons.push(ShadowNoteReason::BucketLiquidNan)
+            }
+            crate::types::LiquidityBucket::Thin => reasons.push(ShadowNoteReason::BucketThinNan),
+        }
     }
 
-    let mut kv: Vec<String> = Vec::new();
-    kv.push("TS_SRC=local".to_string());
-    kv.push(format!("LAT_MS={window_start_ms}"));
-    kv.push(format!("WIN_END={window_end_ms}"));
-    kv.push(format!("BUCKET={}", s.bucket.as_str().to_ascii_uppercase()));
-
-    let notes = format_notes(&reasons, &kv);
+    let notes = format_notes(&reasons);
 
     let mut record: Vec<String> = Vec::with_capacity(SHADOW_HEADER.len());
     record.push(s.run_id.clone());
-    record.push(cfg.schema_version.clone());
+    record.push(SCHEMA_VERSION.to_string());
     record.push(s.signal_id.to_string());
     record.push(s.signal_ts_ms.to_string());
     record.push(window_start_ms.to_string());
@@ -475,7 +572,7 @@ mod tests {
         let pnl_left: f64 = cols[idx("pnl_left_total")].parse().expect("pnl_left_total");
         let pnl_total: f64 = cols[idx("total_pnl")].parse().expect("total_pnl");
         let notes = cols[idx("notes")];
-        assert!(notes.contains("LEGS_PADDED"));
+        assert_eq!(notes, "");
 
         // q_fill: A=10, B=6 => q_set=6, q_fill_avg=8, set_ratio=0.75
         assert_approx_eq!(q_set, 6.0, 1e-9);
@@ -614,8 +711,7 @@ mod tests {
         };
 
         let notes = cols[idx("notes")];
-        assert!(notes.contains("MISSING_BID"));
-        assert!(notes.contains("LEGS_PADDED"));
+        assert_eq!(notes, "MISSING_BID");
 
         let q_set: f64 = cols[idx("q_set")].parse().expect("q_set");
         let q_fill0: f64 = cols[idx("leg0_q_fill")].parse().expect("leg0_q_fill");

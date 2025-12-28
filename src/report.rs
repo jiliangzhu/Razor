@@ -125,7 +125,7 @@ pub fn compute_report(
     thresholds: ReportThresholds,
 ) -> anyhow::Result<Report> {
     if !shadow_log_path.exists() {
-        let (go, reasons) = verdict(0.0, 0.0, thresholds);
+        let (go, reasons) = verdict(0.0, 1.0, thresholds);
         return Ok(Report {
             schema_version: SCHEMA_VERSION.to_string(),
             run_id: run_id.to_string(),
@@ -178,6 +178,7 @@ pub fn compute_report(
     let mut totals_signals: u64 = 0;
     let mut total_shadow_pnl: f64 = 0.0;
     let mut set_ratio_sum: f64 = 0.0;
+    let mut legging_fail_count: u64 = 0;
 
     let mut acc_bucket_liquid = Accum::default();
     let mut acc_bucket_thin = Accum::default();
@@ -230,6 +231,9 @@ pub fn compute_report(
                 totals_signals += 1;
                 total_shadow_pnl += r.total_pnl;
                 set_ratio_sum += r.set_ratio;
+                if r.set_ratio < thresholds.min_avg_set_ratio {
+                    legging_fail_count += 1;
+                }
 
                 min_ts = Some(min_ts.map_or(r.signal_ts_ms, |v| v.min(r.signal_ts_ms)));
                 max_ts = Some(max_ts.map_or(r.signal_ts_ms, |v| v.max(r.signal_ts_ms)));
@@ -272,7 +276,12 @@ pub fn compute_report(
         0.0
     };
 
-    let (go, reasons) = verdict(total_shadow_pnl, avg_set_ratio, thresholds);
+    let legging_fail_share = if totals_signals > 0 {
+        (legging_fail_count as f64) / (totals_signals as f64)
+    } else {
+        1.0
+    };
+    let (go, reasons) = verdict(total_shadow_pnl, legging_fail_share, thresholds);
 
     Ok(Report {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -310,7 +319,7 @@ pub fn compute_report(
 
 fn verdict(
     total_shadow_pnl: f64,
-    avg_set_ratio: f64,
+    legging_fail_share: f64,
     thresholds: ReportThresholds,
 ) -> (bool, Vec<String>) {
     let mut reasons: Vec<String> = Vec::new();
@@ -328,14 +337,21 @@ fn verdict(
         ));
     }
 
-    let ratio_ok = avg_set_ratio >= thresholds.min_avg_set_ratio;
-    if ratio_ok {
-        reasons.push(format!("AvgSetRatio >= {}", thresholds.min_avg_set_ratio));
+    let max_legging_fail_share = 0.15;
+    let legging_ok = legging_fail_share <= max_legging_fail_share;
+    if legging_ok {
+        reasons.push(format!(
+            "LeggingFailShare <= {} (set_ratio < {} share={:.3})",
+            max_legging_fail_share, thresholds.min_avg_set_ratio, legging_fail_share
+        ));
     } else {
-        reasons.push(format!("AvgSetRatio < {}", thresholds.min_avg_set_ratio));
+        reasons.push(format!(
+            "LeggingFailShare > {} (set_ratio < {} share={:.3})",
+            max_legging_fail_share, thresholds.min_avg_set_ratio, legging_fail_share
+        ));
     }
 
-    (pnl_ok && ratio_ok, reasons)
+    (pnl_ok && legging_ok, reasons)
 }
 
 fn render_report_md(report: &Report) -> String {

@@ -15,3 +15,7 @@ RAZOR_MODE=dry_run cargo run -- --config config/config.toml
 ```bash
 cargo run --bin day14_report -- --data-dir data/run_latest
 ```
+
+## Market selection (Phase 1)
+
+冻结口径见：`docs/market_selection.md`（2 个 market：Liquid 主样本 + Thin 压力样本）。

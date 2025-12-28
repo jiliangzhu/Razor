@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Context as _;
 use serde::Serialize;
 
-pub const SCHEMA_VERSION: &str = "shadow_log_v1";
+pub const SCHEMA_VERSION: &str = "1.3.2a";
 
 pub const FILE_TICKS: &str = "ticks.csv";
 pub const FILE_TRADES: &str = "trades.csv";

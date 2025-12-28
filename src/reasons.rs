@@ -5,70 +5,63 @@ use std::path::Path;
 use anyhow::Context as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ShadowReason {
+pub enum ShadowNoteReason {
     NoTrades,
     WindowEmpty,
-    #[allow(dead_code)]
-    DedupHit,
-    BucketNan,
-    LegsPadded,
     MissingBid,
+    MissingBook,
+    BucketThinNan,
+    BucketLiquidNan,
+    FillShareP25Zero,
+    DedupHit,
+    SignalTooOld,
+    LegsMismatch,
+    InternalError,
     InvalidPrice,
     InvalidQty,
 }
 
-impl ShadowReason {
+impl ShadowNoteReason {
     pub const fn as_str(self) -> &'static str {
         match self {
-            ShadowReason::NoTrades => "NO_TRADES",
-            ShadowReason::WindowEmpty => "WINDOW_EMPTY",
-            ShadowReason::DedupHit => "DEDUP_HIT",
-            ShadowReason::BucketNan => "BUCKET_NAN",
-            ShadowReason::LegsPadded => "LEGS_PADDED",
-            ShadowReason::MissingBid => "MISSING_BID",
-            ShadowReason::InvalidPrice => "INVALID_PRICE",
-            ShadowReason::InvalidQty => "INVALID_QTY",
+            ShadowNoteReason::NoTrades => "NO_TRADES",
+            ShadowNoteReason::WindowEmpty => "WINDOW_EMPTY",
+            ShadowNoteReason::MissingBid => "MISSING_BID",
+            ShadowNoteReason::MissingBook => "MISSING_BOOK",
+            ShadowNoteReason::BucketThinNan => "BUCKET_THIN_NAN",
+            ShadowNoteReason::BucketLiquidNan => "BUCKET_LIQUID_NAN",
+            ShadowNoteReason::FillShareP25Zero => "FILL_SHARE_P25_ZERO",
+            ShadowNoteReason::DedupHit => "DEDUP_HIT",
+            ShadowNoteReason::SignalTooOld => "SIGNAL_TOO_OLD",
+            ShadowNoteReason::LegsMismatch => "LEGS_MISMATCH",
+            ShadowNoteReason::InternalError => "INTERNAL_ERROR",
+            ShadowNoteReason::InvalidPrice => "INVALID_PRICE",
+            ShadowNoteReason::InvalidQty => "INVALID_QTY",
         }
     }
 }
 
-impl fmt::Display for ShadowReason {
+impl fmt::Display for ShadowNoteReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-pub fn format_notes(reasons: &[ShadowReason], kv_tokens: &[String]) -> String {
+pub fn format_notes(reasons: &[ShadowNoteReason]) -> String {
     let mut uniq: BTreeSet<&'static str> = BTreeSet::new();
     for r in reasons {
         uniq.insert(r.as_str());
     }
 
-    let mut out: Vec<String> = Vec::new();
-    if uniq.is_empty() {
-        out.push("OK".to_string());
-    } else {
-        out.extend(uniq.into_iter().map(|s| s.to_string()));
-    }
-
-    for kv in kv_tokens {
-        let kv = kv.trim();
-        if kv.is_empty() {
-            continue;
-        }
-        out.push(kv.to_string());
-    }
-
-    out.join("|")
+    uniq.into_iter().collect::<Vec<_>>().join(",")
 }
 
 #[allow(dead_code)]
 pub fn parse_notes_reasons(notes: &str) -> Vec<String> {
-    let left = notes.split(';').next().unwrap_or("");
-    left.split('|')
+    notes
+        .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .filter(|s| !s.contains('='))
         .map(|s| s.to_string())
         .collect()
 }

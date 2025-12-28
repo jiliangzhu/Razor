@@ -296,10 +296,25 @@ fn handle_ws_obj(
         return Ok(());
     };
 
-    if event_type != "book" {
-        return Ok(());
+    match event_type {
+        "book" => handle_ws_book(obj, token_to_market, market_states, ticks, snap_tx, health)?,
+        "price_change" => {
+            handle_ws_price_change(obj, token_to_market, market_states, snap_tx)?;
+        }
+        _ => {}
     }
 
+    Ok(())
+}
+
+fn handle_ws_book(
+    obj: serde_json::Map<String, serde_json::Value>,
+    token_to_market: &HashMap<String, (String, usize)>,
+    market_states: &mut HashMap<String, MarketState>,
+    ticks: &mut CsvAppender,
+    snap_tx: &watch::Sender<Option<MarketSnapshot>>,
+    health: &HealthCounters,
+) -> anyhow::Result<()> {
     let Some(market_id) = obj.get("market").and_then(|v| v.as_str()) else {
         return Ok(());
     };
@@ -322,13 +337,15 @@ fn handle_ws_obj(
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
 
-    let Some((best_bid, best_bid_size_best)) = best_level(bids, PriceSide::Bid) else {
-        return Ok(());
-    };
-    let Some((best_ask, best_ask_size_best)) = best_level(asks, PriceSide::Ask) else {
-        return Ok(());
-    };
+    // Phase 1 hardening:
+    // - Some markets can publish one-sided books (bids=[] or asks=[]). We still want to
+    //   progress the pipeline (ticks/snapshots) without panicking or stalling.
+    // - Missing bid => 0.0 (Shadow will penalize MISSING_BID).
+    // - Missing ask => 1.0 (conservative: prevents false-positive edge).
+    let (best_bid, best_bid_size_best) = best_level(bids, PriceSide::Bid).unwrap_or((0.0, 0.0));
+    let (best_ask, best_ask_size_best) = best_level(asks, PriceSide::Ask).unwrap_or((1.0, 0.0));
 
+    // Depth uses top-3 asks; when asks are missing, this is 0 => bucket degrades to Thin.
     let ask_depth3_usdc = ask_depth3_usdc(asks);
 
     let ts_recv_us = now_us();
@@ -350,7 +367,6 @@ fn handle_ws_obj(
     let Some((_, idx)) = token_to_market.get(token_id) else {
         return Ok(());
     };
-
     if *idx >= state.legs.len() {
         return Ok(());
     }
@@ -362,29 +378,93 @@ fn handle_ws_obj(
     leg.best_ask_size_best = best_ask_size_best;
     leg.ask_depth3_usdc = ask_depth3_usdc;
     leg.ts_recv_us = ts_recv_us;
-    leg.ready = true;
+    leg.ready = leg.best_ask.is_finite() && leg.best_ask > 0.0;
 
-    if state.legs.iter().all(|l| l.ready) {
-        let snap = MarketSnapshot {
-            market_id: state.market_id.clone(),
-            legs: state
-                .legs
-                .iter()
-                .map(|l| LegSnapshot {
-                    token_id: l.token_id.clone(),
-                    best_ask: l.best_ask,
-                    best_bid: l.best_bid,
-                    best_ask_size_best: l.best_ask_size_best,
-                    best_bid_size_best: l.best_bid_size_best,
-                    ask_depth3_usdc: l.ask_depth3_usdc,
-                    ts_recv_us: l.ts_recv_us,
-                })
-                .collect(),
+    maybe_publish_snapshot(state, snap_tx);
+    Ok(())
+}
+
+fn handle_ws_price_change(
+    obj: serde_json::Map<String, serde_json::Value>,
+    token_to_market: &HashMap<String, (String, usize)>,
+    market_states: &mut HashMap<String, MarketState>,
+    snap_tx: &watch::Sender<Option<MarketSnapshot>>,
+) -> anyhow::Result<()> {
+    let Some(changes) = obj.get("price_changes").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+
+    for ch in changes {
+        let Some(ch) = ch.as_object() else { continue };
+        let Some(token_id) = ch.get("asset_id").and_then(|v| v.as_str()) else {
+            continue;
         };
-        let _ = snap_tx.send(Some(snap));
+        let Some((market_id, idx)) = token_to_market.get(token_id) else {
+            continue;
+        };
+        let Some(state) = market_states.get_mut(market_id) else {
+            continue;
+        };
+        if *idx >= state.legs.len() {
+            continue;
+        }
+
+        let best_bid = parse_f64(ch.get("best_bid")).unwrap_or(0.0);
+        let best_ask = parse_f64(ch.get("best_ask")).unwrap_or(0.0);
+
+        let leg = &mut state.legs[*idx];
+        // Best bid: 0 means missing.
+        leg.best_bid = if best_bid.is_finite() && best_bid > 0.0 {
+            best_bid
+        } else {
+            0.0
+        };
+        // Best ask: 0 means missing -> set to 1.0 (conservative).
+        leg.best_ask = if best_ask.is_finite() && best_ask > 0.0 {
+            best_ask
+        } else {
+            1.0
+        };
+        leg.best_bid_size_best = 0.0;
+        leg.best_ask_size_best = 0.0;
+        leg.ts_recv_us = now_us();
+        leg.ready = leg.best_ask.is_finite() && leg.best_ask > 0.0;
+
+        maybe_publish_snapshot(state, snap_tx);
     }
 
     Ok(())
+}
+
+fn parse_f64(v: Option<&serde_json::Value>) -> Option<f64> {
+    let v = v?;
+    if let Some(s) = v.as_str() {
+        return s.parse::<f64>().ok();
+    }
+    v.as_f64()
+}
+
+fn maybe_publish_snapshot(state: &MarketState, snap_tx: &watch::Sender<Option<MarketSnapshot>>) {
+    if !state.legs.iter().all(|l| l.ready) {
+        return;
+    }
+    let snap = MarketSnapshot {
+        market_id: state.market_id.clone(),
+        legs: state
+            .legs
+            .iter()
+            .map(|l| LegSnapshot {
+                token_id: l.token_id.clone(),
+                best_ask: l.best_ask,
+                best_bid: l.best_bid,
+                best_ask_size_best: l.best_ask_size_best,
+                best_bid_size_best: l.best_bid_size_best,
+                ask_depth3_usdc: l.ask_depth3_usdc,
+                ts_recv_us: l.ts_recv_us,
+            })
+            .collect(),
+    };
+    let _ = snap_tx.send(Some(snap));
 }
 
 #[derive(Clone, Copy)]

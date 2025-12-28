@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use crate::buckets::classify_bucket;
 use crate::config::Config;
 use crate::health::HealthCounters;
-use crate::reasons::ShadowReason;
+use crate::reasons::ShadowNoteReason;
 use crate::types::{
     now_ms, Bps, Bucket, BucketMetrics, Leg, MarketDef, MarketSnapshot, Side, Signal, Strategy,
 };
@@ -38,7 +38,7 @@ struct EvalMetrics {
     expected_net_bps: Bps,
     bucket_metrics: BucketMetrics,
     worst_leg_token_id: String,
-    reasons: Vec<ShadowReason>,
+    reasons: Vec<ShadowNoteReason>,
 }
 
 pub async fn run(
