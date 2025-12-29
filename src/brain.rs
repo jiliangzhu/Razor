@@ -286,8 +286,8 @@ fn should_emit(
 mod tests {
     use super::*;
     use crate::config::{
-        BrainConfig, BucketConfig, CalibrationConfig, Config, LiveConfig, PolymarketConfig,
-        ReportConfig, RunConfig, ShadowConfig, SimConfig,
+        BrainConfig, BucketConfig, CalibrationConfig, Config, LiveConfig, MarketSelectConfig,
+        PolymarketConfig, ReportConfig, RunConfig, ShadowConfig, SimConfig,
     };
     use crate::types::LegSnapshot;
 
@@ -314,6 +314,7 @@ mod tests {
             },
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),
+            market_select: MarketSelectConfig::default(),
             report: ReportConfig::default(),
             live: LiveConfig::default(),
             calibration: CalibrationConfig::default(),
@@ -412,6 +413,7 @@ mod tests {
             },
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),
+            market_select: MarketSelectConfig::default(),
             report: ReportConfig::default(),
             live: LiveConfig::default(),
             calibration: CalibrationConfig::default(),

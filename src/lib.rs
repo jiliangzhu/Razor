@@ -1,4 +1,8 @@
+pub mod buckets;
+pub mod config;
+pub mod market_select;
 pub mod reasons;
+pub mod recorder;
 pub mod report;
 pub mod run_meta;
 pub mod schema;

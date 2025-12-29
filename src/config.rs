@@ -14,6 +14,9 @@ pub struct Config {
     pub buckets: BucketConfig,
     #[serde(default)]
     pub shadow: ShadowConfig,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub market_select: MarketSelectConfig,
     #[serde(default)]
     pub report: ReportConfig,
     #[allow(dead_code)]
@@ -205,6 +208,46 @@ fn default_shadow_max_trades() -> usize {
 
 fn default_shadow_max_trade_gap_ms() -> u64 {
     700
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize)]
+pub struct MarketSelectConfig {
+    #[serde(default = "default_market_select_probe_seconds")]
+    pub probe_seconds: u64,
+    #[serde(default = "default_market_select_pool_limit")]
+    pub pool_limit: usize,
+    #[serde(default = "default_market_select_prefer_strategy")]
+    pub prefer_strategy: String,
+    #[serde(default = "default_market_select_max_concurrency")]
+    pub max_concurrency: usize,
+}
+
+impl Default for MarketSelectConfig {
+    fn default() -> Self {
+        Self {
+            probe_seconds: default_market_select_probe_seconds(),
+            pool_limit: default_market_select_pool_limit(),
+            prefer_strategy: default_market_select_prefer_strategy(),
+            max_concurrency: default_market_select_max_concurrency(),
+        }
+    }
+}
+
+fn default_market_select_probe_seconds() -> u64 {
+    3600
+}
+
+fn default_market_select_pool_limit() -> usize {
+    200
+}
+
+fn default_market_select_prefer_strategy() -> String {
+    "any".to_string()
+}
+
+fn default_market_select_max_concurrency() -> usize {
+    5
 }
 
 #[derive(Clone, Debug, Deserialize)]

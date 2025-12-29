@@ -441,8 +441,8 @@ fn settle_one(
 mod tests {
     use super::*;
     use crate::config::{
-        BrainConfig, BucketConfig, CalibrationConfig, Config, LiveConfig, PolymarketConfig,
-        ReportConfig, RunConfig, ShadowConfig, SimConfig,
+        BrainConfig, BucketConfig, CalibrationConfig, Config, LiveConfig, MarketSelectConfig,
+        PolymarketConfig, ReportConfig, RunConfig, ShadowConfig, SimConfig,
     };
     use crate::recorder::CsvAppender;
     use crate::types::{Bps, Bucket, BucketMetrics, Leg, Side, Strategy};
@@ -470,6 +470,7 @@ mod tests {
                 fill_share_thin_p25: 0.1,
             },
             shadow: ShadowConfig::default(),
+            market_select: MarketSelectConfig::default(),
             report: ReportConfig::default(),
             live: LiveConfig::default(),
             calibration: CalibrationConfig::default(),
@@ -617,6 +618,7 @@ mod tests {
                 fill_share_thin_p25: 0.1,
             },
             shadow: ShadowConfig::default(),
+            market_select: MarketSelectConfig::default(),
             report: ReportConfig::default(),
             live: LiveConfig::default(),
             calibration: CalibrationConfig::default(),

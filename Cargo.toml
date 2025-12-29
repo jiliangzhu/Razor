@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "day14_report"
 path = "src/bin/day14_report.rs"
 
+[[bin]]
+name = "market_select"
+path = "src/bin/market_select.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5.23", features = ["derive"] }
