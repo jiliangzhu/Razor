@@ -1,5 +1,6 @@
 use anyhow::Context as _;
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::market_select::metrics::ProbePhase;
@@ -21,6 +22,10 @@ pub struct GammaMarket {
 pub async fn fetch_candidate_pool(cfg: &Config, limit: usize) -> anyhow::Result<Vec<GammaMarket>> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("razor/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_millis(
+            cfg.polymarket.http_connect_timeout_ms,
+        ))
+        .timeout(Duration::from_millis(cfg.polymarket.http_timeout_ms))
         .build()
         .context("build http client")?;
 

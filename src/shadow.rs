@@ -36,6 +36,7 @@ pub async fn run(
     let mut last_written_signal_id: u64 = 0;
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -352,6 +353,13 @@ fn settle_one(
         reasons.push(ShadowNoteReason::WindowEmpty);
     }
 
+    if cfg.shadow.max_trade_gap_ms > 0
+        && window_stats.trades_in_window > 1
+        && window_stats.max_gap_ms > cfg.shadow.max_trade_gap_ms
+    {
+        reasons.push(ShadowNoteReason::WindowDataGap);
+    }
+
     if v_mkt_sum <= 0.0 {
         reasons.push(ShadowNoteReason::NoTrades);
     }
@@ -547,6 +555,7 @@ mod tests {
         });
 
         settle_one(&cfg, &mut out, &store, &s, 100, 1_100).expect("settle");
+        out.flush_and_sync().expect("flush");
 
         let text = std::fs::read_to_string(&tmp).expect("read csv");
         let mut lines = text.lines();
@@ -697,6 +706,7 @@ mod tests {
         });
 
         settle_one(&cfg, &mut out, &store, &s, 100, 1_100).expect("settle");
+        out.flush_and_sync().expect("flush");
 
         let text = std::fs::read_to_string(&tmp).expect("read csv");
         let mut lines = text.lines();

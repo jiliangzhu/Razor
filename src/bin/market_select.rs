@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cfg_raw = std::fs::read_to_string(&args.config).context("read config")?;
     let cfg: razor::config::Config = toml::from_str(&cfg_raw).context("parse config")?;
+    cfg.validate().context("validate config")?;
 
     let opts = razor::market_select::MarketSelectOptions {
         probe_seconds: args

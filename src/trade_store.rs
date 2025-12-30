@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use crate::types::{now_ms, TradeTick};
+use tracing::warn;
 
 /// In-memory ring buffer for Shadow volume queries (Phase 1).
 ///
@@ -11,6 +12,9 @@ pub struct TradeStore {
     trades: VecDeque<TradeTick>,
     recent_ids: HashSet<String>,
     dedup_events: VecDeque<DedupEvent>,
+    last_seen_ts_ms: u64,
+    needs_full_trim: bool,
+    last_out_of_order_warn_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,6 +39,9 @@ impl TradeStore {
             trades: VecDeque::new(),
             recent_ids: HashSet::new(),
             dedup_events: VecDeque::new(),
+            last_seen_ts_ms: 0,
+            needs_full_trim: false,
+            last_out_of_order_warn_ms: 0,
         }
     }
 
@@ -51,11 +58,32 @@ impl TradeStore {
         if t.token_id.is_empty() || t.market_id.is_empty() {
             return PushResult::dropped();
         }
+        if !t.price.is_finite() || !t.size.is_finite() || t.price < 0.0 || t.size <= 0.0 {
+            return PushResult::dropped();
+        }
+        if effective_ingest_ts_ms(&t) == 0 {
+            return PushResult::dropped();
+        }
         if t.trade_id.trim().is_empty() {
             t.trade_id = fallback_trade_id(&t);
         }
 
-        self.trim(now_ms());
+        let now = now_ms();
+        self.trim(now);
+
+        let ts = effective_ingest_ts_ms(&t);
+        if self.last_seen_ts_ms > 0 && ts < self.last_seen_ts_ms {
+            self.needs_full_trim = true;
+            if now.saturating_sub(self.last_out_of_order_warn_ms) >= 10_000 {
+                self.last_out_of_order_warn_ms = now;
+                warn!(
+                    ts_ms = ts,
+                    last_seen_ts_ms = self.last_seen_ts_ms,
+                    "trade tick out-of-order; enabling full-trim fallback"
+                );
+            }
+        }
+        self.last_seen_ts_ms = self.last_seen_ts_ms.max(ts);
 
         if self.recent_ids.contains(&t.trade_id) {
             self.dedup_events.push_back(DedupEvent {
@@ -193,6 +221,7 @@ impl TradeStore {
             self.trades.clear();
             self.recent_ids.clear();
             self.dedup_events.clear();
+            self.needs_full_trim = false;
             return;
         }
 
@@ -211,6 +240,37 @@ impl TradeStore {
                 }
             }
         }
+
+        if self.needs_full_trim {
+            self.full_trim(cutoff);
+            self.needs_full_trim = false;
+        }
+    }
+
+    fn full_trim(&mut self, cutoff: u64) {
+        // Fallback path for out-of-order inserts: we cannot rely on popping from the front.
+        let mut new_trades: VecDeque<TradeTick> = VecDeque::with_capacity(self.trades.len());
+        let mut new_ids: HashSet<String> = HashSet::with_capacity(self.recent_ids.len());
+        for t in self.trades.drain(..) {
+            if effective_ingest_ts_ms(&t) < cutoff {
+                continue;
+            }
+            if !t.trade_id.trim().is_empty() {
+                new_ids.insert(t.trade_id.clone());
+            }
+            new_trades.push_back(t);
+        }
+        self.trades = new_trades;
+        self.recent_ids = new_ids;
+
+        let mut new_events: VecDeque<DedupEvent> = VecDeque::with_capacity(self.dedup_events.len());
+        for e in self.dedup_events.drain(..) {
+            if e.ts_ms < cutoff {
+                continue;
+            }
+            new_events.push_back(e);
+        }
+        self.dedup_events = new_events;
     }
 
     fn enforce_cap(&mut self) -> usize {

@@ -52,6 +52,7 @@ fn main() -> anyhow::Result<()> {
     print_run_meta_section(&args.data_dir, &run_id)?;
     let analysis = analyze_shadow_log(&shadow_path, &run_id)?;
     print_overall_section(&analysis, args.starting_capital);
+    print_reason_section(&analysis);
     print_group_section("By Notes (reasons)", "notes", &analysis.by_notes);
     print_group_section("By Strategy", "strategy", &analysis.by_strategy);
     print_group_section("By Bucket", "bucket", &analysis.by_bucket);
@@ -120,6 +121,8 @@ struct ShadowAnalysis {
     set_ratio_samples: Vec<f64>,
 
     by_notes: BTreeMap<String, Agg>,
+    by_reason: BTreeMap<String, Agg>,
+    by_reason_bucket: BTreeMap<(String, String), Agg>,
     by_strategy: BTreeMap<String, Agg>,
     by_bucket: BTreeMap<String, Agg>,
     by_combo: BTreeMap<(String, String, String), Agg>,
@@ -191,6 +194,8 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
     let mut set_ratio_samples: Vec<f64> = Vec::new();
 
     let mut by_notes: BTreeMap<String, Agg> = BTreeMap::new();
+    let mut by_reason: BTreeMap<String, Agg> = BTreeMap::new();
+    let mut by_reason_bucket: BTreeMap<(String, String), Agg> = BTreeMap::new();
     let mut by_strategy: BTreeMap<String, Agg> = BTreeMap::new();
     let mut by_bucket: BTreeMap<String, Agg> = BTreeMap::new();
     let mut by_combo: BTreeMap<(String, String, String), Agg> = BTreeMap::new();
@@ -290,6 +295,7 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
 
         let notes_raw = record.get(idx_notes).unwrap_or("").trim().to_string();
         let notes_key = canonical_notes_key(&notes_raw);
+        let reasons = explode_reasons(&notes_raw);
 
         let market_id = record.get(idx_market_id).unwrap_or("").trim().to_string();
         let signal_id = match record.get(idx_signal_id).and_then(parse_u64) {
@@ -340,6 +346,19 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
             .or_default()
             .push(total_pnl, pnl_set, pnl_left_total, set_ratio);
 
+        for r in reasons {
+            by_reason.entry(r.clone()).or_default().push(
+                total_pnl,
+                pnl_set,
+                pnl_left_total,
+                set_ratio,
+            );
+            by_reason_bucket
+                .entry((r, bucket_key.clone()))
+                .or_default()
+                .push(total_pnl, pnl_set, pnl_left_total, set_ratio);
+        }
+
         tail.push(TailRow {
             signal_id,
             market_id,
@@ -380,11 +399,27 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
         sum_pnl_left_total,
         set_ratio_samples,
         by_notes,
+        by_reason,
+        by_reason_bucket,
         by_strategy,
         by_bucket,
         by_combo,
         tail,
     })
+}
+
+fn explode_reasons(notes: &str) -> Vec<String> {
+    let notes = notes.trim();
+    if notes.is_empty() {
+        return vec!["OK".to_string()];
+    }
+    let mut parts = parse_notes_reasons(notes);
+    parts.retain(|s| !s.trim().is_empty());
+    if parts.is_empty() {
+        vec!["OK".to_string()]
+    } else {
+        parts
+    }
 }
 
 fn print_run_meta_section(data_dir: &Path, run_id: &str) -> anyhow::Result<()> {
@@ -398,6 +433,12 @@ fn print_run_meta_section(data_dir: &Path, run_id: &str) -> anyhow::Result<()> {
             println!("start_ts_unix_ms={}", m.start_ts_unix_ms);
             println!("config_path={}", m.config_path);
             println!("notes_enum_version={}", m.notes_enum_version);
+            println!(
+                "trade_poll_taker_only={}",
+                m.trade_poll_taker_only
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
         }
         Err(e) => {
             println!("run_id={run_id}");
@@ -470,6 +511,47 @@ fn print_overall_section(a: &ShadowAnalysis, starting_capital: Option<f64>) {
         let pct = (a.sum_total_pnl / c) * 100.0;
         println!("starting_capital={c:.6}");
         println!("pnl_pct={pct:.6}");
+    }
+    println!();
+}
+
+fn print_reason_section(a: &ShadowAnalysis) {
+    println!("== By Reason (exploded) ==");
+    println!("reason,count,share,sum_total_pnl,avg_total_pnl,miss_rate");
+    let denom = a.rows_ok.max(1) as f64;
+
+    let mut rows: Vec<_> = a.by_reason.iter().collect();
+    rows.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+    for (reason, agg) in rows {
+        let share = (agg.count as f64) / denom;
+        println!(
+            "{},{},{:.3},{:.6},{:.6},{:.3}",
+            reason,
+            agg.count,
+            share,
+            agg.sum_total_pnl,
+            agg.avg_total_pnl(),
+            agg.miss_rate()
+        );
+    }
+    println!();
+
+    println!("== Reasons x Bucket ==");
+    println!("reason,bucket,count,share,sum_total_pnl,avg_total_pnl,miss_rate");
+    let mut rows: Vec<_> = a.by_reason_bucket.iter().collect();
+    rows.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+    for ((reason, bucket), agg) in rows {
+        let share = (agg.count as f64) / denom;
+        println!(
+            "{},{},{},{:.3},{:.6},{:.6},{:.3}",
+            reason,
+            bucket,
+            agg.count,
+            share,
+            agg.sum_total_pnl,
+            agg.avg_total_pnl(),
+            agg.miss_rate()
+        );
     }
     println!();
 }
@@ -627,4 +709,123 @@ fn parse_f64(s: &str) -> Option<f64> {
 
 fn parse_u64(s: &str) -> Option<u64> {
     s.trim().parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use razor::schema::SHADOW_HEADER;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tmp_csv(name: &str, contents: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "razor_day14_{name}_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::write(&p, contents).expect("write tmp csv");
+        p
+    }
+
+    fn header_line() -> String {
+        let mut s = SHADOW_HEADER.join(",");
+        s.push('\n');
+        s
+    }
+
+    fn idx(name: &str) -> usize {
+        SHADOW_HEADER
+            .iter()
+            .position(|h| h.trim().eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("missing column {name} in SHADOW_HEADER"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn row(
+        run_id: &str,
+        signal_id: u64,
+        ts_ms: u64,
+        market_id: &str,
+        strategy: &str,
+        bucket: &str,
+        total_pnl: &str,
+        set_ratio: &str,
+        notes: &str,
+    ) -> String {
+        let mut cols: Vec<String> = vec![String::new(); SHADOW_HEADER.len()];
+        cols[idx("run_id")] = run_id.to_string();
+        cols[idx("schema_version")] = super::SCHEMA_VERSION.to_string();
+        cols[idx("signal_id")] = signal_id.to_string();
+        cols[idx("signal_ts_unix_ms")] = ts_ms.to_string();
+        cols[idx("window_start_ms")] = "100".to_string();
+        cols[idx("window_end_ms")] = "1100".to_string();
+        cols[idx("market_id")] = market_id.to_string();
+        cols[idx("strategy")] = strategy.to_string();
+        cols[idx("bucket")] = bucket.to_string();
+        cols[idx("total_pnl")] = total_pnl.to_string();
+        cols[idx("pnl_set")] = "0.0".to_string();
+        cols[idx("pnl_left_total")] = "0.0".to_string();
+        cols[idx("set_ratio")] = set_ratio.to_string();
+        cols[idx("q_set")] = "1.0".to_string();
+        cols[idx("q_req")] = "1.0".to_string();
+        cols[idx("legs_n")] = "2".to_string();
+        cols[idx("notes")] = if notes.contains(',') {
+            format!("\"{}\"", notes.replace('"', "\"\""))
+        } else {
+            notes.to_string()
+        };
+
+        let mut s = cols.join(",");
+        s.push('\n');
+        s
+    }
+
+    #[test]
+    fn explode_reasons_empty_is_ok() {
+        assert_eq!(explode_reasons(""), vec!["OK".to_string()]);
+        assert_eq!(explode_reasons("   "), vec!["OK".to_string()]);
+    }
+
+    #[test]
+    fn reason_aggregation_explodes_multi_reason_notes() {
+        let run_id = "run_1";
+        let csv = format!(
+            "{}{}{}",
+            header_line(),
+            row(
+                run_id,
+                1,
+                1_000,
+                "m1",
+                "binary",
+                "liquid",
+                "-1.0",
+                "0.9",
+                "NO_TRADES,MISSING_BID"
+            ),
+            row(
+                run_id,
+                2,
+                2_000,
+                "m1",
+                "binary",
+                "liquid",
+                "2.0",
+                "0.9",
+                "NO_TRADES"
+            ),
+        );
+        let path = tmp_csv("explode", &csv);
+
+        let a = analyze_shadow_log(&path, run_id).expect("analysis");
+        assert_eq!(a.rows_ok, 2);
+        assert_eq!(a.by_reason.get("NO_TRADES").unwrap().count, 2);
+        assert_eq!(a.by_reason.get("MISSING_BID").unwrap().count, 1);
+        assert!(!a.by_reason.contains_key("OK"));
+    }
 }

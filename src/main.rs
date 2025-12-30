@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg_path = std::path::PathBuf::from(&args.config);
     let cfg_raw = std::fs::read_to_string(&cfg_path).context("read config")?;
     let cfg: config::Config = toml::from_str(&cfg_raw).context("parse config")?;
+    cfg.validate().context("validate config")?;
 
     std::fs::create_dir_all(&cfg.run.data_dir).context("create data_dir")?;
     let run_ctx = run_context::create_run_context(&cfg.run.data_dir).context("init run context")?;
@@ -75,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         config_path: cfg_path.display().to_string(),
         trade_ts_source: "local".to_string(),
         notes_enum_version: "v1".to_string(),
+        trade_poll_taker_only: Some(cfg.shadow.trade_poll_taker_only),
     }
     .write_to_dir(&run_ctx.run_dir)
     .context("write run_meta.json")?;
@@ -162,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
         let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             const STALE_WARN_MS: u64 = 30_000;
 
             loop {
@@ -195,6 +198,10 @@ async fn main() -> anyhow::Result<()> {
                     snap_rx_lag_ms = snap_rx_lag_ms.unwrap_or(0),
                     ticks_processed = snap.ticks_processed,
                     trades_written = snap.trades_written,
+                    trades_invalid = snap.trades_invalid,
+                    trades_dropped = snap.trades_dropped,
+                    trades_duplicated = snap.trades_duplicated,
+                    snapshots_stale_skipped = snap.snapshots_stale_skipped,
                     signals_emitted = snap.signals_emitted,
                     shadow_processed = snap.shadow_processed,
                     "health"

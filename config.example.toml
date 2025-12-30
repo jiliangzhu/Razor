@@ -23,6 +23,7 @@ window_start_ms = 100
 window_end_ms = 1100
 trade_poll_interval_ms = 1000
 trade_poll_limit = 500
+trade_poll_taker_only = true
 trade_retention_ms = 5000
 
 [live]

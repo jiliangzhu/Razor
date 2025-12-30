@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::market_select::gamma::GammaMarket;
 use crate::market_select::metrics::MarketScoreRowComputed;
+use crate::recorder::CsvAppender;
 use crate::types::now_ms;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +63,19 @@ pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> 
         .unwrap_or_else(|| default_out_dir(&cfg.run.data_dir, &run_id));
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
 
+    // Crash-tolerant progress output: append completed probe rows as they arrive.
+    // The final `market_scores.csv` remains deterministically sorted at the end.
+    let mut partial = match CsvAppender::open(
+        out_dir.join("market_scores.partial.csv"),
+        &output::MARKET_SCORES_HEADER,
+    ) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(error = %e, "open market_scores.partial.csv failed; continuing without partial output");
+            None
+        }
+    };
+
     let markets = gamma::fetch_candidate_pool(cfg, opts.pool_limit)
         .await
         .context("fetch gamma candidate pool")?;
@@ -70,35 +85,86 @@ pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> 
     if markets.is_empty() {
         anyhow::bail!("no gamma candidates remain after prefer_strategy filtering");
     }
+    let candidates_total = markets.len();
 
     let sem = Arc::new(Semaphore::new(cfg.market_select.max_concurrency.max(1)));
-    let mut handles = Vec::with_capacity(markets.len());
+    let mut join_set: JoinSet<(GammaMarket, anyhow::Result<MarketScoreRowComputed>)> =
+        JoinSet::new();
 
     for m in markets {
         let cfg = cfg.clone();
         let sem = sem.clone();
         let run_id = run_id.clone();
         let opts = opts.clone();
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore");
             let res = probe::probe_market(&cfg, &run_id, &m, opts.probe_seconds).await;
             (m, res)
-        }));
+        });
     }
 
     let mut rows: Vec<MarketScoreRowComputed> = Vec::new();
-    for h in handles {
-        let (m, res) = h.await.context("join probe task")?;
-        match res {
-            Ok(r) => rows.push(r),
-            Err(e) => {
-                warn!(gamma_id = %m.gamma_id, condition_id = %m.condition_id, error = %e, "probe failed");
+    let mut probes_completed_ok: usize = 0;
+    let mut probes_completed_failed: usize = 0;
+    let mut aborted = false;
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut ctrl_c => {
+                aborted = true;
+                warn!(
+                    completed_ok = probes_completed_ok,
+                    completed_failed = probes_completed_failed,
+                    total = candidates_total,
+                    "ctrl-c received; aborting remaining probes and writing partial outputs"
+                );
+                if let Err(e) = res {
+                    warn!(error = %e, "ctrl-c handler error");
+                }
+                join_set.abort_all();
+                break;
+            }
+            next = join_set.join_next() => {
+                let Some(next) = next else { break; };
+                match next {
+                    Ok((_m, Ok(r))) => {
+                        probes_completed_ok += 1;
+                        if let Some(out) = partial.as_mut() {
+                            if let Err(e) = out.write_record(output::row_to_record(&r.row)) {
+                                warn!(error = %e, "write market_scores.partial.csv row failed");
+                            }
+                        }
+                        rows.push(r);
+                        if probes_completed_ok % 10 == 0 {
+                            info!(completed_ok = probes_completed_ok, total = candidates_total, "probe progress");
+                        }
+                    }
+                    Ok((m, Err(e))) => {
+                        probes_completed_failed += 1;
+                        warn!(gamma_id = %m.gamma_id, condition_id = %m.condition_id, error = %e, "probe failed");
+                    }
+                    Err(e) => {
+                        probes_completed_failed += 1;
+                        warn!(error = %e, "probe task join error");
+                    }
+                }
             }
         }
     }
 
-    if rows.is_empty() {
-        anyhow::bail!("all probes failed; no rows to write");
+    if aborted {
+        // Drain aborted tasks to avoid running probes in the background after we start writing outputs.
+        while let Some(_res) = join_set.join_next().await {}
+    }
+
+    if let Some(out) = partial.as_mut() {
+        if let Err(e) = out.flush_and_sync() {
+            warn!(error = %e, "flush market_scores.partial.csv failed");
+        }
     }
 
     // Deterministic ordering for output: by gamma_volume24hr desc then gamma_id asc.
@@ -109,20 +175,37 @@ pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> 
 
     output::write_market_scores_csv(&out_dir, &rows).context("write market_scores.csv")?;
 
-    let selected = select::select_two_markets(&rows, opts.prefer_strategy)
-        .context("select liquid+thin markets")?;
+    let (selected_opt, selection_error) =
+        match select::select_two_markets(&rows, opts.prefer_strategy) {
+            Ok(selected) => (Some(selected), None),
+            Err(e) => (None, Some(e)),
+        };
 
-    output::write_suggest_toml(&out_dir, &selected).context("write suggest.toml")?;
-    output::write_recommendation_json(&out_dir, &run_id, opts.probe_seconds, &selected)
-        .context("write recommendation.json")?;
+    output::write_suggest_toml(&out_dir, selected_opt.as_ref()).context("write suggest.toml")?;
+    output::write_recommendation_json(
+        &out_dir,
+        &run_id,
+        opts.probe_seconds,
+        candidates_total,
+        probes_completed_ok,
+        probes_completed_failed,
+        aborted,
+        selected_opt.as_ref(),
+        selection_error.as_ref().map(|e| e.to_string()),
+    )
+    .context("write recommendation.json")?;
 
     info!(
         out_dir = %out_dir.display(),
-        liquid = %selected.liquid.row.gamma_id,
-        thin = %selected.thin.row.gamma_id,
+        liquid = selected_opt.as_ref().map(|s| s.liquid.row.gamma_id.as_str()).unwrap_or(""),
+        thin = selected_opt.as_ref().map(|s| s.thin.row.gamma_id.as_str()).unwrap_or(""),
+        aborted,
         "market_select done"
     );
 
+    if let Some(e) = selection_error {
+        anyhow::bail!("selection failed: {e}");
+    }
     Ok(())
 }
 

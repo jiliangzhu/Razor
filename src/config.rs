@@ -30,6 +30,52 @@ pub struct Config {
     pub sim: SimConfig,
 }
 
+impl Config {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // Shadow window sanity.
+        if self.shadow.window_end_ms <= self.shadow.window_start_ms {
+            anyhow::bail!(
+                "invalid shadow window: window_end_ms={} must be > window_start_ms={}",
+                self.shadow.window_end_ms,
+                self.shadow.window_start_ms
+            );
+        }
+        if self.shadow.trade_retention_ms < self.shadow.window_end_ms {
+            anyhow::bail!(
+                "invalid shadow trade_retention_ms={} must be >= window_end_ms={}",
+                self.shadow.trade_retention_ms,
+                self.shadow.window_end_ms
+            );
+        }
+        if self.shadow.trade_poll_interval_ms == 0 {
+            anyhow::bail!("invalid shadow.trade_poll_interval_ms=0 (must be > 0)");
+        }
+        if self.shadow.trade_poll_limit == 0 {
+            anyhow::bail!("invalid shadow.trade_poll_limit=0 (must be > 0)");
+        }
+
+        // Fill shares must be finite and within [0, 1].
+        fn check_share(name: &str, v: f64) -> anyhow::Result<()> {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                anyhow::bail!("{name} must be finite in [0,1], got {v}");
+            }
+            Ok(())
+        }
+        check_share(
+            "buckets.fill_share_liquid_p25",
+            self.buckets.fill_share_liquid_p25,
+        )?;
+        check_share(
+            "buckets.fill_share_thin_p25",
+            self.buckets.fill_share_thin_p25,
+        )?;
+        check_share("sim.sim_fill_share_liquid", self.sim.sim_fill_share_liquid)?;
+        check_share("sim.sim_fill_share_thin", self.sim.sim_fill_share_thin)?;
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct PolymarketConfig {
     #[serde(default = "default_gamma_base")]
@@ -38,6 +84,18 @@ pub struct PolymarketConfig {
     pub ws_base: String,
     #[serde(default = "default_data_api_base")]
     pub data_api_base: String,
+    /// Default timeout applied to all HTTP requests (ms).
+    #[serde(default = "default_http_timeout_ms")]
+    pub http_timeout_ms: u64,
+    /// TCP connect timeout for HTTP requests (ms).
+    #[serde(default = "default_http_connect_timeout_ms")]
+    pub http_connect_timeout_ms: u64,
+    /// WebSocket connect timeout (ms).
+    #[serde(default = "default_ws_connect_timeout_ms")]
+    pub ws_connect_timeout_ms: u64,
+    /// WebSocket write timeout for subscribe/ping (ms).
+    #[serde(default = "default_ws_write_timeout_ms")]
+    pub ws_write_timeout_ms: u64,
 }
 
 impl Default for PolymarketConfig {
@@ -46,6 +104,10 @@ impl Default for PolymarketConfig {
             gamma_base: default_gamma_base(),
             ws_base: default_ws_base(),
             data_api_base: default_data_api_base(),
+            http_timeout_ms: default_http_timeout_ms(),
+            http_connect_timeout_ms: default_http_connect_timeout_ms(),
+            ws_connect_timeout_ms: default_ws_connect_timeout_ms(),
+            ws_write_timeout_ms: default_ws_write_timeout_ms(),
         }
     }
 }
@@ -60,6 +122,22 @@ fn default_ws_base() -> String {
 
 fn default_data_api_base() -> String {
     "https://data-api.polymarket.com".to_string()
+}
+
+fn default_http_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_http_connect_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_ws_connect_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_ws_write_timeout_ms() -> u64 {
+    3_000
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -159,6 +237,8 @@ pub struct ShadowConfig {
     pub trade_poll_interval_ms: u64,
     #[serde(default = "default_trade_poll_limit")]
     pub trade_poll_limit: usize,
+    #[serde(default = "default_trade_poll_taker_only")]
+    pub trade_poll_taker_only: bool,
     #[serde(default = "default_trade_retention_ms")]
     pub trade_retention_ms: u64,
     #[serde(default = "default_shadow_max_trades")]
@@ -175,6 +255,7 @@ impl Default for ShadowConfig {
             window_end_ms: default_window_end_ms(),
             trade_poll_interval_ms: default_trade_poll_interval_ms(),
             trade_poll_limit: default_trade_poll_limit(),
+            trade_poll_taker_only: default_trade_poll_taker_only(),
             trade_retention_ms: default_trade_retention_ms(),
             max_trades: default_shadow_max_trades(),
             max_trade_gap_ms: default_shadow_max_trade_gap_ms(),
@@ -196,6 +277,10 @@ fn default_trade_poll_interval_ms() -> u64 {
 
 fn default_trade_poll_limit() -> usize {
     500
+}
+
+fn default_trade_poll_taker_only() -> bool {
+    true
 }
 
 fn default_trade_retention_ms() -> u64 {

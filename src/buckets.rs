@@ -3,6 +3,7 @@ use crate::reasons::ShadowNoteReason;
 use crate::types::{Bps, Bucket, BucketMetrics, MarketSnapshot};
 
 const INVALID_SPREAD_BPS: Bps = Bps(i32::MAX);
+const MAX_DEPTH3_USDC: f64 = 10_000_000.0;
 
 pub fn fill_share_p25(bucket: Bucket, cfg: &BucketConfig) -> f64 {
     match bucket {
@@ -35,13 +36,20 @@ pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
     }
 
     let mut is_depth3_degraded = false;
+    let mut depth_unit_suspect = false;
     let mut worst_leg_index = 0usize;
     let mut worst_depth = f64::INFINITY;
 
     for (idx, leg) in snapshot.legs.iter().enumerate() {
         let d = depth_sanitize(leg.ask_depth3_usdc);
-        if !leg.ask_depth3_usdc.is_finite() || leg.ask_depth3_usdc <= 0.0 {
+        if !leg.ask_depth3_usdc.is_finite()
+            || leg.ask_depth3_usdc <= 0.0
+            || leg.ask_depth3_usdc > MAX_DEPTH3_USDC
+        {
             is_depth3_degraded = true;
+            if leg.ask_depth3_usdc.is_finite() && leg.ask_depth3_usdc > MAX_DEPTH3_USDC {
+                depth_unit_suspect = true;
+            }
         }
         if d < worst_depth {
             worst_depth = d;
@@ -64,6 +72,9 @@ pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
     };
 
     let mut reasons: Vec<ShadowNoteReason> = Vec::new();
+    if depth_unit_suspect {
+        reasons.push(ShadowNoteReason::DepthUnitSuspect);
+    }
     if bucket == Bucket::Thin && (is_depth3_degraded || spread == INVALID_SPREAD_BPS.raw()) {
         reasons.push(ShadowNoteReason::BucketThinNan);
     }
@@ -86,7 +97,7 @@ pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
 }
 
 fn depth_sanitize(depth3_usdc: f64) -> f64 {
-    if !depth3_usdc.is_finite() || depth3_usdc < 0.0 {
+    if !depth3_usdc.is_finite() || !(0.0..=MAX_DEPTH3_USDC).contains(&depth3_usdc) {
         f64::INFINITY
     } else {
         depth3_usdc

@@ -62,6 +62,10 @@ pub async fn probe_market(
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("razor/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_millis(
+            cfg.polymarket.http_connect_timeout_ms,
+        ))
+        .timeout(Duration::from_millis(cfg.polymarket.http_timeout_ms))
         .build()
         .context("build http client")?;
 
@@ -81,8 +85,10 @@ pub async fn probe_market(
     let mut trade_tick = tokio::time::interval(Duration::from_millis(
         cfg.shadow.trade_poll_interval_ms.max(200),
     ));
+    trade_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Snapshot sample tick: fixed 1 Hz so samples_total stays bounded and comparable.
     let mut sample_tick = tokio::time::interval(Duration::from_secs(1));
+    sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     while now_ms() < probe_end_ms {
         // (Re)connect WS as needed.
@@ -90,12 +96,21 @@ pub async fn probe_market(
             if now_ms() >= probe_end_ms {
                 break;
             }
-            match tokio_tungstenite::connect_async(&ws_url).await {
-                Ok((ws, _)) => {
+            match tokio::time::timeout(
+                Duration::from_millis(cfg.polymarket.ws_connect_timeout_ms),
+                tokio_tungstenite::connect_async(&ws_url),
+            )
+            .await
+            {
+                Ok(Ok((ws, _))) => {
                     let (mut sink, mut stream) = ws.split();
-                    sink.send(Message::Text(subscribe_msg.to_string().into()))
-                        .await
-                        .context("send ws subscribe")?;
+                    ws_send(
+                        &mut sink,
+                        Message::Text(subscribe_msg.to_string().into()),
+                        Duration::from_millis(cfg.polymarket.ws_write_timeout_ms),
+                    )
+                    .await
+                    .context("send ws subscribe")?;
                     ws_connected = true;
                     backoff = Duration::from_secs(1);
                     info!(
@@ -106,6 +121,7 @@ pub async fn probe_market(
                     );
 
                     let mut ping = tokio::time::interval(Duration::from_secs(10));
+                    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                     loop {
                         if now_ms() >= probe_end_ms {
@@ -113,10 +129,23 @@ pub async fn probe_market(
                         }
                         tokio::select! {
                             _ = ping.tick() => {
-                                let _ = sink.send(Message::Text("PING".to_string().into())).await;
+                                let _ = ws_send(
+                                    &mut sink,
+                                    Message::Text("PING".to_string().into()),
+                                    Duration::from_millis(cfg.polymarket.ws_write_timeout_ms),
+                                ).await;
                             }
                             _ = trade_tick.tick() => {
-                                poll_trades(&client, &trades_url, cfg.shadow.trade_poll_limit, &m.condition_id, &mut trades_acc, &mut trade_dedup).await;
+                                poll_trades(
+                                    &client,
+                                    &trades_url,
+                                    cfg.shadow.trade_poll_limit,
+                                    cfg.shadow.trade_poll_taker_only,
+                                    &m.condition_id,
+                                    &mut trades_acc,
+                                    &mut trade_dedup,
+                                )
+                                .await;
                             }
                             _ = sample_tick.tick() => {
                                 sample_snapshot(cfg, m, run_id, probe_start_ms, probe_end_ms, probe_seconds, &mut legs, &mut snap_acc, &mut trades_acc)?;
@@ -149,13 +178,24 @@ pub async fn probe_market(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(
                         gamma_id = %m.gamma_id,
                         condition_id = %m.condition_id,
                         error = %e,
                         backoff_ms = backoff.as_millis() as u64,
                         "probe ws connect failed; backing off"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+                Err(_) => {
+                    warn!(
+                        gamma_id = %m.gamma_id,
+                        condition_id = %m.condition_id,
+                        timeout_ms = cfg.polymarket.ws_connect_timeout_ms,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "probe ws connect timeout; backing off"
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -203,6 +243,18 @@ pub async fn probe_market(
         cfg.brain.min_net_edge_bps,
         cfg.shadow.trade_poll_limit,
     ))
+}
+
+async fn ws_send<S>(sink: &mut S, msg: Message, timeout: Duration) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(timeout, sink.send(msg))
+        .await
+        .context("ws send timeout")?
+        .context("ws send error")?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -280,6 +332,7 @@ async fn poll_trades(
     client: &reqwest::Client,
     url: &str,
     trade_poll_limit: usize,
+    trade_poll_taker_only: bool,
     condition_id: &str,
     trades_acc: &mut TradesAccum,
     trade_dedup: &mut HashSet<String>,
@@ -288,7 +341,7 @@ async fn poll_trades(
         .get(url)
         .query(&[
             ("limit", trade_poll_limit.to_string()),
-            ("takerOnly", "true".to_string()),
+            ("takerOnly", trade_poll_taker_only.to_string()),
             ("market", condition_id.to_string()),
         ])
         .send()
@@ -322,20 +375,24 @@ async fn poll_trades(
 
         let exchange_ts_ms = normalize_ts_ms(t.timestamp);
         let ingest_ts_ms = now_ms();
-        let ts_ms = if exchange_ts_ms > 0 {
-            exchange_ts_ms
-        } else {
-            ingest_ts_ms
-        };
+        // Frozen timestamp domain (Phase 1 / market_select): use **local ingest time** for
+        // all window/gap/coverage statistics so results are directly comparable with Phase 1
+        // shadow windows.
+        let stat_ts_ms = ingest_ts_ms;
 
         // Required dedup key:
         // - Prefer (condition_id, token_id, exchange_ts_ms, price, size)
         // - If exchange ts is missing/zero: fall back to ingest_ts_ms.
+        let key_ts_ms = if exchange_ts_ms > 0 {
+            exchange_ts_ms
+        } else {
+            ingest_ts_ms
+        };
         let key = format!(
             "{}:{}:{}:{:016x}:{:016x}",
             condition_id,
             t.asset_id,
-            ts_ms,
+            key_ts_ms,
             t.price.to_bits(),
             t.size.to_bits()
         );
@@ -347,7 +404,7 @@ async fn poll_trades(
         trade_dedup.insert(key);
 
         trades_acc.trades_total += 1;
-        trades_acc.trade_ts_ms.push(ts_ms);
+        trades_acc.trade_ts_ms.push(stat_ts_ms);
     }
 }
 
@@ -488,17 +545,11 @@ enum PriceSide {
 fn best_level(levels: &[serde_json::Value], side: PriceSide) -> Option<(f64, f64)> {
     let mut best: Option<(f64, f64)> = None;
     for lvl in levels {
-        let Some(p) = lvl.get("price").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Ok(px) = p.parse::<f64>() else {
+        let Some(px) = parse_f64(lvl.get("price")).filter(|v| v.is_finite() && *v > 0.0) else {
             continue;
         };
 
-        let sz = lvl
-            .get("size")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
+        let sz = parse_f64(lvl.get("size"))
             .filter(|s| s.is_finite() && *s > 0.0)
             .unwrap_or(0.0);
 
@@ -526,16 +577,10 @@ fn best_level(levels: &[serde_json::Value], side: PriceSide) -> Option<(f64, f64
 fn ask_depth3_usdc(levels: &[serde_json::Value]) -> f64 {
     let mut best = [(f64::INFINITY, 0.0f64); 3];
     for lvl in levels {
-        let Some(p) = lvl.get("price").and_then(|v| v.as_str()) else {
+        let Some(px) = parse_f64(lvl.get("price")).filter(|v| v.is_finite() && *v > 0.0) else {
             continue;
         };
-        let Some(s) = lvl.get("size").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Ok(px) = p.parse::<f64>() else {
-            continue;
-        };
-        let Ok(sz) = s.parse::<f64>() else {
+        let Some(sz) = parse_f64(lvl.get("size")).filter(|v| v.is_finite() && *v > 0.0) else {
             continue;
         };
 
@@ -550,4 +595,42 @@ fn ask_depth3_usdc(levels: &[serde_json::Value]) -> f64 {
         .filter(|(px, _)| px.is_finite())
         .map(|(px, sz)| px * sz)
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_approx_eq::assert_approx_eq;
+    use serde_json::json;
+
+    #[test]
+    fn ws_book_level_parses_numeric_and_string_fields() {
+        let bids = vec![
+            json!({"price": 0.49, "size": 1.0}),
+            json!({"price": "0.5", "size": "2"}),
+        ];
+        let (px, sz) = best_level(&bids, PriceSide::Bid).expect("best bid");
+        assert_approx_eq!(px, 0.5);
+        assert_approx_eq!(sz, 2.0);
+
+        let asks = vec![
+            json!({"price": 0.6, "size": 1.0}),
+            json!({"price": "0.55", "size": "2"}),
+        ];
+        let (px, sz) = best_level(&asks, PriceSide::Ask).expect("best ask");
+        assert_approx_eq!(px, 0.55);
+        assert_approx_eq!(sz, 2.0);
+    }
+
+    #[test]
+    fn ws_book_depth3_parses_numeric_and_sums_top3() {
+        let asks = vec![
+            json!({"price": 0.6, "size": 10.0}),    // 6
+            json!({"price": "0.55", "size": 20.0}), // 11
+            json!({"price": 0.50, "size": "30"}),   // 15
+            json!({"price": 0.65, "size": 40.0}),   // excluded
+        ];
+        let d = ask_depth3_usdc(&asks);
+        assert_approx_eq!(d, 32.0);
+    }
 }

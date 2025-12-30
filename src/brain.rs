@@ -9,7 +9,8 @@ use crate::config::Config;
 use crate::health::HealthCounters;
 use crate::reasons::ShadowNoteReason;
 use crate::types::{
-    now_ms, Bps, Bucket, BucketMetrics, Leg, MarketDef, MarketSnapshot, Side, Signal, Strategy,
+    now_ms, now_us, Bps, Bucket, BucketMetrics, Leg, MarketDef, MarketSnapshot, Side, Signal,
+    Strategy,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +55,9 @@ pub async fn run(
     let mut last_by_key: HashMap<(String, Strategy, i32), LastSignalState> = HashMap::new();
     let cooldown_ms = cfg.brain.signal_cooldown_ms;
     let min_net_edge = Bps::new(cfg.brain.min_net_edge_bps);
+    let mut last_prune_ms: u64 = 0;
+    const DEDUP_PRUNE_EVERY_MS: u64 = 60_000;
+    const DEDUP_TTL_MS: u64 = 60 * 60_000;
 
     let mut supported: HashMap<String, usize> = HashMap::new();
     for m in markets {
@@ -83,7 +87,37 @@ pub async fn run(
             continue;
         }
 
+        let max_recv_us = snap.legs.iter().map(|l| l.ts_recv_us).max().unwrap_or(0);
+        if max_recv_us > 0 {
+            let lag_ms = now_us().saturating_sub(max_recv_us) / 1000;
+            if lag_ms > cfg.brain.max_snapshot_staleness_ms {
+                health.inc_snapshots_stale_skipped(1);
+                debug!(
+                    market_id = %snap.market_id,
+                    lag_ms,
+                    threshold_ms = cfg.brain.max_snapshot_staleness_ms,
+                    "skip: snapshot stale"
+                );
+                continue;
+            }
+        }
+
         let signal_ts_ms = now_ms();
+        if signal_ts_ms.saturating_sub(last_prune_ms) >= DEDUP_PRUNE_EVERY_MS {
+            last_prune_ms = signal_ts_ms;
+            let cutoff = signal_ts_ms.saturating_sub(DEDUP_TTL_MS);
+            let before = last_by_key.len();
+            last_by_key.retain(|_, v| v.ts_ms >= cutoff);
+            let after = last_by_key.len();
+            if after < before {
+                debug!(
+                    pruned = before - after,
+                    remaining = after,
+                    ttl_ms = DEDUP_TTL_MS,
+                    "brain dedup state pruned"
+                );
+            }
+        }
 
         let metrics = match eval_snapshot(&cfg, &snap) {
             Ok(v) => v,

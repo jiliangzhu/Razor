@@ -24,6 +24,7 @@ impl Default for ReportThresholds {
 pub struct Report {
     pub schema_version: String,
     pub run_id: String,
+    pub trade_poll_taker_only: Option<bool>,
     pub period: Period,
     pub totals: Totals,
     pub by_bucket: ByBucket,
@@ -99,7 +100,10 @@ pub fn generate_report_files(
 ) -> anyhow::Result<Report> {
     let shadow_path = data_dir.join(FILE_SHADOW_LOG);
 
-    let report = compute_report(&shadow_path, run_id, thresholds)?;
+    let mut report = compute_report(&shadow_path, run_id, thresholds)?;
+    if let Ok(meta) = crate::run_meta::RunMeta::read_from_dir(data_dir) {
+        report.trade_poll_taker_only = meta.trade_poll_taker_only;
+    }
     write_report_files(data_dir, &report)?;
 
     Ok(report)
@@ -129,6 +133,7 @@ pub fn compute_report(
         return Ok(Report {
             schema_version: SCHEMA_VERSION.to_string(),
             run_id: run_id.to_string(),
+            trade_poll_taker_only: None,
             period: Period {
                 start_unix_ms: 0,
                 end_unix_ms: 0,
@@ -286,6 +291,7 @@ pub fn compute_report(
     Ok(Report {
         schema_version: SCHEMA_VERSION.to_string(),
         run_id: run_id.to_string(),
+        trade_poll_taker_only: None,
         period: Period {
             start_unix_ms: min_ts.unwrap_or(0),
             end_unix_ms: max_ts.unwrap_or(0),
@@ -361,6 +367,13 @@ fn render_report_md(report: &Report) -> String {
     out.push_str("# Razor Day14 Report\n\n");
     out.push_str(&format!("schema_version: `{}`\n\n", report.schema_version));
     out.push_str(&format!("run_id: `{}`\n\n", report.run_id));
+    out.push_str(&format!(
+        "trade_poll_taker_only: `{}`\n\n",
+        report
+            .trade_poll_taker_only
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
     out.push_str(&format!(
         "period: {} .. {}\n\n",
         report.period.start_unix_ms, report.period.end_unix_ms

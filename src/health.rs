@@ -17,10 +17,12 @@ pub struct HealthCounters {
     trades_written: AtomicU64,
     trades_dropped: AtomicU64,
     trades_duplicated: AtomicU64,
+    trades_invalid: AtomicU64,
     trade_poll_hit_limit: AtomicU64,
     signals_emitted: AtomicU64,
     signals_suppressed: AtomicU64,
     signals_dropped: AtomicU64,
+    snapshots_stale_skipped: AtomicU64,
     shadow_processed: AtomicU64,
     trade_store_size: AtomicU64,
     trade_store_evicted: AtomicU64,
@@ -46,6 +48,10 @@ impl HealthCounters {
         self.trades_duplicated.fetch_add(n, Ordering::Relaxed);
     }
 
+    pub fn inc_trades_invalid(&self, n: u64) {
+        self.trades_invalid.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn inc_trade_poll_hit_limit(&self, n: u64) {
         self.trade_poll_hit_limit.fetch_add(n, Ordering::Relaxed);
     }
@@ -60,6 +66,10 @@ impl HealthCounters {
 
     pub fn inc_signals_dropped(&self, n: u64) {
         self.signals_dropped.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn inc_snapshots_stale_skipped(&self, n: u64) {
+        self.snapshots_stale_skipped.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn inc_shadow_processed(&self, n: u64) {
@@ -93,10 +103,12 @@ impl HealthCounters {
             trades_written: self.trades_written.load(Ordering::Relaxed),
             trades_dropped: self.trades_dropped.load(Ordering::Relaxed),
             trades_duplicated: self.trades_duplicated.load(Ordering::Relaxed),
+            trades_invalid: self.trades_invalid.load(Ordering::Relaxed),
             trade_poll_hit_limit: self.trade_poll_hit_limit.load(Ordering::Relaxed),
             signals_emitted: self.signals_emitted.load(Ordering::Relaxed),
             signals_suppressed: self.signals_suppressed.load(Ordering::Relaxed),
             signals_dropped: self.signals_dropped.load(Ordering::Relaxed),
+            snapshots_stale_skipped: self.snapshots_stale_skipped.load(Ordering::Relaxed),
             shadow_processed: self.shadow_processed.load(Ordering::Relaxed),
             trade_store_size: self.trade_store_size.load(Ordering::Relaxed),
             trade_store_evicted: self.trade_store_evicted.load(Ordering::Relaxed),
@@ -126,10 +138,12 @@ pub struct HealthSnapshot {
     pub trades_written: u64,
     pub trades_dropped: u64,
     pub trades_duplicated: u64,
+    pub trades_invalid: u64,
     pub trade_poll_hit_limit: u64,
     pub signals_emitted: u64,
     pub signals_suppressed: u64,
     pub signals_dropped: u64,
+    pub snapshots_stale_skipped: u64,
     pub shadow_processed: u64,
     pub trade_store_size: u64,
     pub trade_store_evicted: u64,
@@ -155,6 +169,7 @@ pub fn spawn_health_writer(
         };
 
         let mut tick = tokio::time::interval(Duration::from_secs(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {

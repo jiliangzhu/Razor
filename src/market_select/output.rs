@@ -65,85 +65,136 @@ pub fn write_market_scores_csv(
     Ok(())
 }
 
-pub fn write_suggest_toml(out_dir: &Path, selected: &SelectedTwoMarkets) -> anyhow::Result<()> {
+pub fn write_suggest_toml(
+    out_dir: &Path,
+    selected: Option<&SelectedTwoMarkets>,
+) -> anyhow::Result<()> {
     let path = out_dir.join(FILE_SUGGEST_TOML);
-    let content = format!(
-        "[run]\nmarket_ids = [\"{}\", \"{}\"]\n",
-        selected.liquid.row.gamma_id, selected.thin.row.gamma_id
-    );
+    let content = match selected {
+        Some(selected) => format!(
+            "[run]\nmarket_ids = [\"{}\", \"{}\"]\n",
+            selected.liquid.row.gamma_id, selected.thin.row.gamma_id
+        ),
+        None => "[run]\nmarket_ids = []\n".to_string(),
+    };
     std::fs::write(&path, content.as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_recommendation_json(
     out_dir: &Path,
     run_id: &str,
     probe_seconds: u64,
-    selected: &SelectedTwoMarkets,
+    candidates_total: usize,
+    probes_completed_ok: usize,
+    probes_completed_failed: usize,
+    aborted: bool,
+    selected: Option<&SelectedTwoMarkets>,
+    selection_error: Option<String>,
 ) -> anyhow::Result<()> {
     let path = out_dir.join(FILE_RECOMMENDATION_JSON);
 
-    let liquid = SelectedMarketOut::from(&selected.liquid);
-    let thin = SelectedMarketOut::from(&selected.thin);
+    let (
+        selected_out,
+        probe_hour_of_day_utc,
+        probe_market_phase,
+        poll_gap_max_ms,
+        trade_gap_max_ms,
+        trade_time_coverage_ok,
+        estimated_trades_lost,
+        passes_gap_p50_ms,
+        passes_gap_p90_ms,
+        passes_gap_max_ms,
+        probe_warnings,
+    ) = match selected {
+        Some(selected) => {
+            let liquid = SelectedMarketOut::from(&selected.liquid);
+            let thin = SelectedMarketOut::from(&selected.thin);
+
+            (
+                Some(SelectedOut { liquid, thin }),
+                Some(Map2u32 {
+                    liquid: selected.liquid.probe_hour_of_day_utc,
+                    thin: selected.thin.probe_hour_of_day_utc,
+                }),
+                Some(Map2 {
+                    liquid: selected.liquid.probe_market_phase.as_str().to_string(),
+                    thin: selected.thin.probe_market_phase.as_str().to_string(),
+                }),
+                Some(Map2u64 {
+                    liquid: selected.liquid.poll_gap_max_ms,
+                    thin: selected.thin.poll_gap_max_ms,
+                }),
+                Some(Map2u64 {
+                    liquid: selected.liquid.trade_gap_max_ms,
+                    thin: selected.thin.trade_gap_max_ms,
+                }),
+                Some(Map2bool {
+                    liquid: selected.liquid.trade_time_coverage_ok,
+                    thin: selected.thin.trade_time_coverage_ok,
+                }),
+                Some(Map2u64 {
+                    liquid: selected.liquid.estimated_trades_lost,
+                    thin: selected.thin.estimated_trades_lost,
+                }),
+                Some(Map2u64 {
+                    liquid: selected.liquid.passes_gap_p50_ms,
+                    thin: selected.thin.passes_gap_p50_ms,
+                }),
+                Some(Map2u64 {
+                    liquid: selected.liquid.passes_gap_p90_ms,
+                    thin: selected.thin.passes_gap_p90_ms,
+                }),
+                Some(Map2u64 {
+                    liquid: selected.liquid.passes_gap_max_ms,
+                    thin: selected.thin.passes_gap_max_ms,
+                }),
+                Some(Map2vec {
+                    liquid: selected
+                        .liquid
+                        .probe_warnings
+                        .iter()
+                        .map(|w| w.as_str().to_string())
+                        .collect(),
+                    thin: selected
+                        .thin
+                        .probe_warnings
+                        .iter()
+                        .map(|w| w.as_str().to_string())
+                        .collect(),
+                }),
+            )
+        }
+        None => (
+            None, None, None, None, None, None, None, None, None, None, None,
+        ),
+    };
 
     let out = RecommendationOut {
         run_id: run_id.to_string(),
         probe_seconds,
+        aborted,
+        candidates_total,
+        probes_completed_ok,
+        probes_completed_failed,
+        selection_error,
         bucket_after_degrade: BUCKET_AFTER_DEGRADE.to_string(),
-        selected: SelectedOut { liquid, thin },
 
         // Include the required fields as top-level maps for quick eyeballing.
-        probe_hour_of_day_utc: Map2u32 {
-            liquid: selected.liquid.probe_hour_of_day_utc,
-            thin: selected.thin.probe_hour_of_day_utc,
-        },
-        probe_market_phase: Map2 {
-            liquid: selected.liquid.probe_market_phase.as_str().to_string(),
-            thin: selected.thin.probe_market_phase.as_str().to_string(),
-        },
-        poll_gap_max_ms: Map2u64 {
-            liquid: selected.liquid.poll_gap_max_ms,
-            thin: selected.thin.poll_gap_max_ms,
-        },
-        trade_gap_max_ms: Map2u64 {
-            liquid: selected.liquid.trade_gap_max_ms,
-            thin: selected.thin.trade_gap_max_ms,
-        },
-        trade_time_coverage_ok: Map2bool {
-            liquid: selected.liquid.trade_time_coverage_ok,
-            thin: selected.thin.trade_time_coverage_ok,
-        },
-        estimated_trades_lost: Map2u64 {
-            liquid: selected.liquid.estimated_trades_lost,
-            thin: selected.thin.estimated_trades_lost,
-        },
-        passes_gap_p50_ms: Map2u64 {
-            liquid: selected.liquid.passes_gap_p50_ms,
-            thin: selected.thin.passes_gap_p50_ms,
-        },
-        passes_gap_p90_ms: Map2u64 {
-            liquid: selected.liquid.passes_gap_p90_ms,
-            thin: selected.thin.passes_gap_p90_ms,
-        },
-        passes_gap_max_ms: Map2u64 {
-            liquid: selected.liquid.passes_gap_max_ms,
-            thin: selected.thin.passes_gap_max_ms,
-        },
-        probe_warnings: Map2vec {
-            liquid: selected
-                .liquid
-                .probe_warnings
-                .iter()
-                .map(|w| w.as_str().to_string())
-                .collect(),
-            thin: selected
-                .thin
-                .probe_warnings
-                .iter()
-                .map(|w| w.as_str().to_string())
-                .collect(),
-        },
+        probe_hour_of_day_utc,
+        probe_market_phase,
+        poll_gap_max_ms,
+        trade_gap_max_ms,
+        trade_time_coverage_ok,
+        estimated_trades_lost,
+        passes_gap_p50_ms,
+        passes_gap_p90_ms,
+        passes_gap_max_ms,
+        probe_warnings,
+
+        selected: selected_out,
     };
 
     let json = serde_json::to_vec_pretty(&out).context("serialize recommendation.json")?;
@@ -151,7 +202,7 @@ pub fn write_recommendation_json(
     Ok(())
 }
 
-fn row_to_record(row: &MarketScoreRow) -> [String; 31] {
+pub(super) fn row_to_record(row: &MarketScoreRow) -> [String; 31] {
     [
         row.run_id.clone(),
         row.probe_start_unix_ms.to_string(),
@@ -198,21 +249,26 @@ fn fmt_f64(v: f64) -> String {
 struct RecommendationOut {
     pub run_id: String,
     pub probe_seconds: u64,
-    pub probe_hour_of_day_utc: Map2u32,
-    pub probe_market_phase: Map2,
+    pub aborted: bool,
+    pub candidates_total: usize,
+    pub probes_completed_ok: usize,
+    pub probes_completed_failed: usize,
+    pub selection_error: Option<String>,
+    pub probe_hour_of_day_utc: Option<Map2u32>,
+    pub probe_market_phase: Option<Map2>,
 
-    pub poll_gap_max_ms: Map2u64,
-    pub trade_gap_max_ms: Map2u64,
-    pub trade_time_coverage_ok: Map2bool,
-    pub estimated_trades_lost: Map2u64,
-    pub passes_gap_p50_ms: Map2u64,
-    pub passes_gap_p90_ms: Map2u64,
-    pub passes_gap_max_ms: Map2u64,
+    pub poll_gap_max_ms: Option<Map2u64>,
+    pub trade_gap_max_ms: Option<Map2u64>,
+    pub trade_time_coverage_ok: Option<Map2bool>,
+    pub estimated_trades_lost: Option<Map2u64>,
+    pub passes_gap_p50_ms: Option<Map2u64>,
+    pub passes_gap_p90_ms: Option<Map2u64>,
+    pub passes_gap_max_ms: Option<Map2u64>,
 
     pub bucket_after_degrade: String,
-    pub probe_warnings: Map2vec,
+    pub probe_warnings: Option<Map2vec>,
 
-    pub selected: SelectedOut,
+    pub selected: Option<SelectedOut>,
 }
 
 #[derive(Debug, Serialize)]

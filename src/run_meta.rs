@@ -14,6 +14,8 @@ pub struct RunMeta {
     pub config_path: String,
     pub trade_ts_source: String,
     pub notes_enum_version: String,
+    #[serde(default)]
+    pub trade_poll_taker_only: Option<bool>,
 }
 
 impl RunMeta {
