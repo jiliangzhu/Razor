@@ -5,17 +5,20 @@ use std::path::Path;
 use anyhow::Context as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ShadowNoteReason {
+pub enum Reason {
+    Ok,
     NoTrades,
-    WindowEmpty,
-    WindowDataGap,
     MissingBid,
-    MissingBook,
     BucketThinNan,
     BucketLiquidNan,
+    DedupHit,
+    WindowEmpty,
+    InvalidSignal,
+    RoundGateBlocked,
+    WindowDataGap,
+    MissingBook,
     DepthUnitSuspect,
     FillShareP25Zero,
-    DedupHit,
     SignalTooOld,
     LegsMismatch,
     InternalError,
@@ -23,35 +26,84 @@ pub enum ShadowNoteReason {
     InvalidQty,
 }
 
-impl ShadowNoteReason {
+impl Reason {
     pub const fn as_str(self) -> &'static str {
         match self {
-            ShadowNoteReason::NoTrades => "NO_TRADES",
-            ShadowNoteReason::WindowEmpty => "WINDOW_EMPTY",
-            ShadowNoteReason::WindowDataGap => "WINDOW_DATA_GAP",
-            ShadowNoteReason::MissingBid => "MISSING_BID",
-            ShadowNoteReason::MissingBook => "MISSING_BOOK",
-            ShadowNoteReason::BucketThinNan => "BUCKET_THIN_NAN",
-            ShadowNoteReason::BucketLiquidNan => "BUCKET_LIQUID_NAN",
-            ShadowNoteReason::DepthUnitSuspect => "DEPTH_UNIT_SUSPECT",
-            ShadowNoteReason::FillShareP25Zero => "FILL_SHARE_P25_ZERO",
-            ShadowNoteReason::DedupHit => "DEDUP_HIT",
-            ShadowNoteReason::SignalTooOld => "SIGNAL_TOO_OLD",
-            ShadowNoteReason::LegsMismatch => "LEGS_MISMATCH",
-            ShadowNoteReason::InternalError => "INTERNAL_ERROR",
-            ShadowNoteReason::InvalidPrice => "INVALID_PRICE",
-            ShadowNoteReason::InvalidQty => "INVALID_QTY",
+            Reason::Ok => "OK",
+            Reason::NoTrades => "NO_TRADES",
+            Reason::MissingBid => "MISSING_BID",
+            Reason::BucketThinNan => "BUCKET_THIN_NAN",
+            Reason::BucketLiquidNan => "BUCKET_LIQUID_NAN",
+            Reason::DedupHit => "DEDUP_HIT",
+            Reason::WindowEmpty => "WINDOW_EMPTY",
+            Reason::InvalidSignal => "INVALID_SIGNAL",
+            Reason::RoundGateBlocked => "ROUND_GATE_BLOCKED",
+            Reason::WindowDataGap => "WINDOW_DATA_GAP",
+            Reason::MissingBook => "MISSING_BOOK",
+            Reason::DepthUnitSuspect => "DEPTH_UNIT_SUSPECT",
+            Reason::FillShareP25Zero => "FILL_SHARE_P25_ZERO",
+            Reason::SignalTooOld => "SIGNAL_TOO_OLD",
+            Reason::LegsMismatch => "LEGS_MISMATCH",
+            Reason::InternalError => "INTERNAL_ERROR",
+            Reason::InvalidPrice => "INVALID_PRICE",
+            Reason::InvalidQty => "INVALID_QTY",
         }
     }
 }
 
-impl fmt::Display for ShadowNoteReason {
+impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-pub fn format_notes(reasons: &[ShadowNoteReason]) -> String {
+pub fn format_notes(reason: Reason, cycle_id: &str) -> String {
+    format!("reason={},cycle_id={}", reason.as_str(), cycle_id)
+}
+
+pub fn parse_notes_reasons(notes: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in notes.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = part.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("reason") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    out.push(v.to_string());
+                }
+            }
+        } else {
+            out.push(part.to_string());
+        }
+    }
+    out
+}
+
+#[allow(dead_code)]
+pub fn extract_note_value(notes: &str, key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    for part in notes.split(',') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+pub fn format_reason_list(reasons: &[Reason]) -> String {
     let mut uniq: BTreeSet<&'static str> = BTreeSet::new();
     for r in reasons {
         uniq.insert(r.as_str());
@@ -61,7 +113,7 @@ pub fn format_notes(reasons: &[ShadowNoteReason]) -> String {
 }
 
 #[allow(dead_code)]
-pub fn parse_notes_reasons(notes: &str) -> Vec<String> {
+pub fn parse_notes_reasons_legacy(notes: &str) -> Vec<String> {
     notes
         .split(',')
         .map(|s| s.trim())

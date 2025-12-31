@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
         start_ts_unix_ms: run_ctx.start_ts_ms,
         config_path: cfg_path.display().to_string(),
         trade_ts_source: "local".to_string(),
-        notes_enum_version: "v1".to_string(),
+        notes_enum_version: "v2".to_string(),
         trade_poll_taker_only: Some(cfg.shadow.trade_poll_taker_only),
     }
     .write_to_dir(&run_ctx.run_dir)

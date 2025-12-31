@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use serde::Serialize;
 
 use crate::buckets::BucketDecision;
-use crate::reasons::ShadowNoteReason;
+use crate::reasons::Reason;
 use crate::types::{Bps, Bucket};
 
 pub const BUCKET_AFTER_DEGRADE: &str = "thin";
@@ -142,12 +142,11 @@ impl SnapshotAccum {
             self.depth3_degraded_count += 1;
         }
 
-        if bucket_decision.reasons.iter().any(|r| {
-            matches!(
-                r,
-                ShadowNoteReason::BucketThinNan | ShadowNoteReason::BucketLiquidNan
-            )
-        }) {
+        if bucket_decision
+            .reasons
+            .iter()
+            .any(|r| matches!(r, Reason::BucketThinNan | Reason::BucketLiquidNan))
+        {
             self.bucket_nan_count += 1;
         }
 

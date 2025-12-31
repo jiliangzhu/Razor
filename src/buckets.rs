@@ -1,5 +1,5 @@
 use crate::config::BucketConfig;
-use crate::reasons::ShadowNoteReason;
+use crate::reasons::Reason;
 use crate::types::{Bps, Bucket, BucketMetrics, MarketSnapshot};
 
 const INVALID_SPREAD_BPS: Bps = Bps(i32::MAX);
@@ -17,7 +17,7 @@ pub struct BucketDecision {
     pub bucket: Bucket,
     pub worst_leg_token_id: String,
     pub metrics: BucketMetrics,
-    pub reasons: Vec<ShadowNoteReason>,
+    pub reasons: Vec<Reason>,
 }
 
 pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
@@ -31,7 +31,7 @@ pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
                 worst_depth3_usdc: f64::NAN,
                 is_depth3_degraded: true,
             },
-            reasons: vec![ShadowNoteReason::BucketThinNan],
+            reasons: vec![Reason::BucketThinNan],
         };
     }
 
@@ -58,37 +58,40 @@ pub fn classify_bucket(snapshot: &MarketSnapshot) -> BucketDecision {
     }
 
     let worst = &snapshot.legs[worst_leg_index];
-    let spread = spread_bps(worst.best_bid, worst.best_ask).raw();
+    let spread = spread_bps(worst.best_bid, worst.best_ask);
+    let spread_invalid = spread.is_none();
+    let spread_raw = spread.map(|s| s.raw()).unwrap_or(INVALID_SPREAD_BPS.raw());
     let worst_depth3 = if is_depth3_degraded {
         f64::NAN
     } else {
         worst_depth
     };
 
-    let bucket = if !is_depth3_degraded && spread < 20 && worst_depth3 > 500.0 {
-        Bucket::Liquid
-    } else {
-        Bucket::Thin
-    };
+    let bucket =
+        if !is_depth3_degraded && !spread_invalid && spread_raw < 20 && worst_depth3 > 500.0 {
+            Bucket::Liquid
+        } else {
+            Bucket::Thin
+        };
 
-    let mut reasons: Vec<ShadowNoteReason> = Vec::new();
+    let mut reasons: Vec<Reason> = Vec::new();
     if depth_unit_suspect {
-        reasons.push(ShadowNoteReason::DepthUnitSuspect);
+        reasons.push(Reason::DepthUnitSuspect);
     }
-    if bucket == Bucket::Thin && (is_depth3_degraded || spread == INVALID_SPREAD_BPS.raw()) {
-        reasons.push(ShadowNoteReason::BucketThinNan);
+    if is_depth3_degraded || spread_invalid {
+        reasons.push(Reason::BucketThinNan);
     }
 
     BucketDecision {
         bucket,
-        worst_leg_token_id: if is_depth3_degraded || spread == INVALID_SPREAD_BPS.raw() {
+        worst_leg_token_id: if is_depth3_degraded || spread_invalid {
             String::new()
         } else {
             worst.token_id.clone()
         },
         metrics: BucketMetrics {
             worst_leg_index,
-            worst_spread_bps: spread,
+            worst_spread_bps: spread_raw,
             worst_depth3_usdc: worst_depth3,
             is_depth3_degraded,
         },
@@ -104,25 +107,25 @@ fn depth_sanitize(depth3_usdc: f64) -> f64 {
     }
 }
 
-fn spread_bps(best_bid: f64, best_ask: f64) -> Bps {
+fn spread_bps(best_bid: f64, best_ask: f64) -> Option<Bps> {
     if !best_bid.is_finite() || !best_ask.is_finite() {
-        return INVALID_SPREAD_BPS;
+        return None;
     }
     if best_bid <= 0.0 || best_ask <= 0.0 {
-        return INVALID_SPREAD_BPS;
+        return None;
     }
     if best_ask < best_bid {
-        return INVALID_SPREAD_BPS;
+        return None;
     }
     let mid = (best_ask + best_bid) / 2.0;
     if !mid.is_finite() || mid <= 0.0 {
-        return INVALID_SPREAD_BPS;
+        return None;
     }
     let ratio = (best_ask - best_bid) / mid;
     if !ratio.is_finite() || ratio < 0.0 {
-        return INVALID_SPREAD_BPS;
+        return None;
     }
-    Bps::from_cost_ratio(ratio)
+    Some(Bps::from_cost_ratio(ratio))
 }
 
 #[cfg(test)]

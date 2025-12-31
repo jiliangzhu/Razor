@@ -23,6 +23,84 @@ struct GammaMarket {
     condition_id: String,
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: String,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(rename = "marketSlug", default)]
+    market_slug: Option<String>,
+    #[serde(rename = "roundSlug", default)]
+    round_slug: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+fn extract_market_slug(market: &GammaMarket) -> Option<String> {
+    market
+        .slug
+        .clone()
+        .or_else(|| market.market_slug.clone())
+        .or_else(|| market.round_slug.clone())
+}
+
+fn extract_round_start_ms(market: &GammaMarket) -> Option<(u64, &'static str)> {
+    let keys = [
+        "roundStartTime",
+        "roundStartAt",
+        "roundStart",
+        "round_start_time",
+        "epochStartTime",
+        "epochStartAt",
+        "epochStart",
+        "epoch_start_time",
+        "startAt",
+        "startDate",
+        "startsAt",
+        "startTime",
+    ];
+    for key in keys {
+        if let Some(value) = market.extra.get(key) {
+            if let Some(ms) = parse_ts_value_ms(value) {
+                return Some((ms, key));
+            }
+        }
+    }
+    None
+}
+
+fn parse_ts_value_ms(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(num) => num.as_f64().and_then(normalize_ts_value_ms),
+        serde_json::Value::String(s) => s.parse::<f64>().ok().and_then(normalize_ts_value_ms),
+        _ => None,
+    }
+}
+
+fn normalize_ts_value_ms(raw: f64) -> Option<u64> {
+    if !raw.is_finite() || raw <= 0.0 {
+        return None;
+    }
+    let ms = if raw > 1_000_000_000_000.0 {
+        raw
+    } else if raw > 1_000_000_000.0 {
+        raw * 1000.0
+    } else {
+        return None;
+    };
+    if ms.is_finite() {
+        Some(ms as u64)
+    } else {
+        None
+    }
+}
+
+fn classify_market_type(round_key: Option<&str>) -> Option<String> {
+    let key = round_key?.to_ascii_lowercase();
+    if key.contains("epoch") {
+        Some("epoch".to_string())
+    } else if key.contains("round") {
+        Some("round".to_string())
+    } else {
+        None
+    }
 }
 
 pub async fn fetch_markets(cfg: &Config) -> anyhow::Result<Vec<MarketDef>> {
@@ -64,9 +142,16 @@ pub async fn fetch_markets(cfg: &Config) -> anyhow::Result<Vec<MarketDef>> {
             continue;
         }
 
+        let market_slug = extract_market_slug(&m);
+        let round_start = extract_round_start_ms(&m);
+        let market_type = classify_market_type(round_start.as_ref().map(|(_, key)| *key));
+
         out.push(MarketDef {
             market_id: m.condition_id,
             token_ids,
+            market_slug,
+            market_type,
+            round_start_ms: round_start.map(|(ms, _)| ms),
         });
     }
 

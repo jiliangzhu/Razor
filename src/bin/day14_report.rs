@@ -4,13 +4,15 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use clap::Parser;
 
-use razor::reasons::parse_notes_reasons;
+use razor::reasons::{extract_note_value, parse_notes_reasons};
 use razor::run_meta::RunMeta;
 use razor::schema::SCHEMA_VERSION;
+use razor::types::Bps;
 
 const SET_RATIO_OK_THRESHOLD: f64 = 0.85;
 const MAX_LEGGING_FAIL_SHARE: f64 = 0.15;
 const PNL_THRESHOLD: f64 = 0.0;
+const STRESS_DUMP_SLIPPAGE_ASSUMED: f64 = 0.10;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -52,11 +54,13 @@ fn main() -> anyhow::Result<()> {
     print_run_meta_section(&args.data_dir, &run_id)?;
     let analysis = analyze_shadow_log(&shadow_path, &run_id)?;
     print_overall_section(&analysis, args.starting_capital);
+    print_stress_section(&analysis);
     print_reason_section(&analysis);
-    print_group_section("By Notes (reasons)", "notes", &analysis.by_notes);
+    print_group_section("By Notes (reason)", "notes", &analysis.by_notes);
     print_group_section("By Strategy", "strategy", &analysis.by_strategy);
     print_group_section("By Bucket", "bucket", &analysis.by_bucket);
     print_combo_section(&analysis.by_combo);
+    print_cycle_section(&analysis.by_cycle);
     print_tail_slice_section(&analysis.tail);
 
     Ok(())
@@ -68,15 +72,28 @@ struct Agg {
     sum_total_pnl: f64,
     sum_pnl_set: f64,
     sum_pnl_left_total: f64,
+    sum_set_ratio: f64,
+    sum_fill_ratio: f64,
     miss_set_ratio: u64,
 }
 
 impl Agg {
-    fn push(&mut self, total_pnl: f64, pnl_set: f64, pnl_left_total: f64, set_ratio: f64) {
+    fn push(
+        &mut self,
+        total_pnl: f64,
+        pnl_set: f64,
+        pnl_left_total: f64,
+        set_ratio: f64,
+        fill_ratio: f64,
+    ) {
         self.count += 1;
         self.sum_total_pnl += total_pnl;
         self.sum_pnl_set += pnl_set;
         self.sum_pnl_left_total += pnl_left_total;
+        self.sum_set_ratio += set_ratio;
+        if fill_ratio.is_finite() {
+            self.sum_fill_ratio += fill_ratio;
+        }
         if set_ratio < SET_RATIO_OK_THRESHOLD {
             self.miss_set_ratio += 1;
         }
@@ -95,6 +112,22 @@ impl Agg {
             0.0
         } else {
             (self.miss_set_ratio as f64) / (self.count as f64)
+        }
+    }
+
+    fn avg_set_ratio(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_set_ratio / (self.count as f64)
+        }
+    }
+
+    fn avg_fill_ratio(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_fill_ratio / (self.count as f64)
         }
     }
 }
@@ -117,6 +150,7 @@ struct ShadowAnalysis {
     sum_total_pnl: f64,
     sum_pnl_set: f64,
     sum_pnl_left_total: f64,
+    sum_stress_total_pnl: f64,
 
     set_ratio_samples: Vec<f64>,
 
@@ -126,8 +160,17 @@ struct ShadowAnalysis {
     by_strategy: BTreeMap<String, Agg>,
     by_bucket: BTreeMap<String, Agg>,
     by_combo: BTreeMap<(String, String, String), Agg>,
+    by_cycle: BTreeMap<String, CycleAgg>,
 
     tail: Vec<TailRow>,
+}
+
+#[derive(Default, Clone)]
+struct CycleAgg {
+    count_signals: u64,
+    sum_total_pnl: f64,
+    worst_pnl: f64,
+    worst_reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +208,7 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
     let idx_pnl_left_total =
         find_col(&header, "pnl_left_total").context("missing column: pnl_left_total")?;
     let idx_set_ratio = find_col(&header, "set_ratio").context("missing column: set_ratio")?;
+    let idx_q_fill_avg = find_col(&header, "q_fill_avg").context("missing column: q_fill_avg")?;
     let idx_q_set = find_col(&header, "q_set").context("missing column: q_set")?;
     let idx_q_req = find_col(&header, "q_req").context("missing column: q_req")?;
     let idx_legs_n = find_col(&header, "legs_n").context("missing column: legs_n")?;
@@ -172,6 +216,24 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
     let idx_market_id = find_col(&header, "market_id").context("missing column: market_id")?;
     let idx_signal_id = find_col(&header, "signal_id").context("missing column: signal_id")?;
     let idx_strategy = find_col(&header, "strategy").context("missing column: strategy")?;
+    let idx_leg0_p_limit =
+        find_col(&header, "leg0_p_limit").context("missing column: leg0_p_limit")?;
+    let idx_leg0_best_bid =
+        find_col(&header, "leg0_best_bid").context("missing column: leg0_best_bid")?;
+    let idx_leg0_q_fill =
+        find_col(&header, "leg0_q_fill").context("missing column: leg0_q_fill")?;
+    let idx_leg1_p_limit =
+        find_col(&header, "leg1_p_limit").context("missing column: leg1_p_limit")?;
+    let idx_leg1_best_bid =
+        find_col(&header, "leg1_best_bid").context("missing column: leg1_best_bid")?;
+    let idx_leg1_q_fill =
+        find_col(&header, "leg1_q_fill").context("missing column: leg1_q_fill")?;
+    let idx_leg2_p_limit =
+        find_col(&header, "leg2_p_limit").context("missing column: leg2_p_limit")?;
+    let idx_leg2_best_bid =
+        find_col(&header, "leg2_best_bid").context("missing column: leg2_best_bid")?;
+    let idx_leg2_q_fill =
+        find_col(&header, "leg2_q_fill").context("missing column: leg2_q_fill")?;
 
     let mut rows_total: u64 = 0;
     let mut rows_other_run: u64 = 0;
@@ -190,6 +252,7 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
     let mut sum_total_pnl: f64 = 0.0;
     let mut sum_pnl_set: f64 = 0.0;
     let mut sum_pnl_left_total: f64 = 0.0;
+    let mut sum_stress_total_pnl: f64 = 0.0;
 
     let mut set_ratio_samples: Vec<f64> = Vec::new();
 
@@ -199,6 +262,7 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
     let mut by_strategy: BTreeMap<String, Agg> = BTreeMap::new();
     let mut by_bucket: BTreeMap<String, Agg> = BTreeMap::new();
     let mut by_combo: BTreeMap<(String, String, String), Agg> = BTreeMap::new();
+    let mut by_cycle: BTreeMap<String, CycleAgg> = BTreeMap::new();
     let mut tail: Vec<TailRow> = Vec::new();
 
     for record in rdr.records() {
@@ -252,6 +316,13 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
                 continue;
             }
         };
+        let q_fill_avg = match record.get(idx_q_fill_avg).and_then(parse_f64) {
+            Some(v) => v,
+            None => {
+                rows_bad += 1;
+                continue;
+            }
+        };
         let q_set = match record.get(idx_q_set).and_then(parse_f64) {
             Some(v) => v,
             None => {
@@ -281,6 +352,12 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
             }
         };
 
+        let fill_ratio = if q_req > 0.0 && q_req.is_finite() {
+            q_fill_avg / q_req
+        } else {
+            0.0
+        };
+
         let strategy_raw = record
             .get(idx_strategy)
             .unwrap_or("")
@@ -294,8 +371,11 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
         .to_string();
 
         let notes_raw = record.get(idx_notes).unwrap_or("").trim().to_string();
-        let notes_key = canonical_notes_key(&notes_raw);
+        let reason = extract_reason(&notes_raw);
+        let notes_key = reason.clone();
         let reasons = explode_reasons(&notes_raw);
+        let cycle_id =
+            extract_note_value(&notes_raw, "cycle_id").unwrap_or_else(|| "unknown".to_string());
 
         let market_id = record.get(idx_market_id).unwrap_or("").trim().to_string();
         let signal_id = match record.get(idx_signal_id).and_then(parse_u64) {
@@ -310,6 +390,15 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
         sum_total_pnl += total_pnl;
         sum_pnl_set += pnl_set;
         sum_pnl_left_total += pnl_left_total;
+        let leg_idxs = [
+            (idx_leg0_p_limit, idx_leg0_best_bid, idx_leg0_q_fill),
+            (idx_leg1_p_limit, idx_leg1_best_bid, idx_leg1_q_fill),
+            (idx_leg2_p_limit, idx_leg2_best_bid, idx_leg2_q_fill),
+        ];
+        let stress_total_pnl =
+            compute_stress_total_pnl(&record, &leg_idxs, legs_n as usize, q_set, pnl_set)
+                .unwrap_or(total_pnl);
+        sum_stress_total_pnl += stress_total_pnl;
         set_ratio_samples.push(set_ratio);
 
         match strategy_key.as_str() {
@@ -328,23 +417,26 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
             pnl_set,
             pnl_left_total,
             set_ratio,
+            fill_ratio,
         );
         by_strategy.entry(strategy_key.clone()).or_default().push(
             total_pnl,
             pnl_set,
             pnl_left_total,
             set_ratio,
+            fill_ratio,
         );
         by_bucket.entry(bucket_key.clone()).or_default().push(
             total_pnl,
             pnl_set,
             pnl_left_total,
             set_ratio,
+            fill_ratio,
         );
         by_combo
             .entry((strategy_key.clone(), bucket_key.clone(), notes_key.clone()))
             .or_default()
-            .push(total_pnl, pnl_set, pnl_left_total, set_ratio);
+            .push(total_pnl, pnl_set, pnl_left_total, set_ratio, fill_ratio);
 
         for r in reasons {
             by_reason.entry(r.clone()).or_default().push(
@@ -352,11 +444,12 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
                 pnl_set,
                 pnl_left_total,
                 set_ratio,
+                fill_ratio,
             );
             by_reason_bucket
                 .entry((r, bucket_key.clone()))
                 .or_default()
-                .push(total_pnl, pnl_set, pnl_left_total, set_ratio);
+                .push(total_pnl, pnl_set, pnl_left_total, set_ratio, fill_ratio);
         }
 
         tail.push(TailRow {
@@ -371,6 +464,14 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
             pnl_left_total,
             notes: notes_key,
         });
+
+        let cycle_entry = by_cycle.entry(cycle_id).or_default();
+        cycle_entry.count_signals += 1;
+        cycle_entry.sum_total_pnl += total_pnl;
+        if cycle_entry.count_signals == 1 || total_pnl < cycle_entry.worst_pnl {
+            cycle_entry.worst_pnl = total_pnl;
+            cycle_entry.worst_reason = reason.clone();
+        }
     }
 
     tail.sort_by(|a, b| {
@@ -397,6 +498,7 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
         sum_total_pnl,
         sum_pnl_set,
         sum_pnl_left_total,
+        sum_stress_total_pnl,
         set_ratio_samples,
         by_notes,
         by_reason,
@@ -404,6 +506,7 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
         by_strategy,
         by_bucket,
         by_combo,
+        by_cycle,
         tail,
     })
 }
@@ -420,6 +523,40 @@ fn explode_reasons(notes: &str) -> Vec<String> {
     } else {
         parts
     }
+}
+
+fn extract_reason(notes: &str) -> String {
+    let mut parts = parse_notes_reasons(notes);
+    parts.retain(|s| !s.trim().is_empty());
+    parts.into_iter().next().unwrap_or_else(|| "OK".to_string())
+}
+
+fn compute_stress_total_pnl(
+    record: &csv::StringRecord,
+    leg_idxs: &[(usize, usize, usize)],
+    legs_n: usize,
+    q_set: f64,
+    pnl_set: f64,
+) -> Option<f64> {
+    let mut pnl_left_total = 0.0;
+    let dump_mult = 1.0 - STRESS_DUMP_SLIPPAGE_ASSUMED;
+    let legs_n = legs_n.min(leg_idxs.len());
+    for (p_limit_idx, best_bid_idx, q_fill_idx) in leg_idxs.iter().take(legs_n) {
+        let limit_price = parse_f64(record.get(*p_limit_idx)?)?;
+        let best_bid = parse_f64(record.get(*best_bid_idx)?)?;
+        let q_fill = parse_f64(record.get(*q_fill_idx)?)?;
+        let q_left = (q_fill - q_set).max(0.0);
+        let bid_missing = !best_bid.is_finite() || best_bid <= 0.0;
+        let exit_price = if bid_missing {
+            0.0
+        } else {
+            best_bid * dump_mult
+        };
+        let cost = q_left * Bps::FEE_POLY.apply_cost(limit_price);
+        let proceeds = q_left * Bps::FEE_POLY.apply_proceeds(exit_price);
+        pnl_left_total += proceeds - cost;
+    }
+    Some(pnl_set + pnl_left_total)
 }
 
 fn print_run_meta_section(data_dir: &Path, run_id: &str) -> anyhow::Result<()> {
@@ -515,9 +652,19 @@ fn print_overall_section(a: &ShadowAnalysis, starting_capital: Option<f64>) {
     println!();
 }
 
+fn print_stress_section(a: &ShadowAnalysis) {
+    println!("== Stress PnL Summary ==");
+    println!("base_total_pnl={:.6}", a.sum_total_pnl);
+    println!("stress_total_pnl={:.6}", a.sum_stress_total_pnl);
+    if a.sum_stress_total_pnl < 0.0 {
+        println!("WARNING: STRESS_NEGATIVE");
+    }
+    println!();
+}
+
 fn print_reason_section(a: &ShadowAnalysis) {
     println!("== By Reason (exploded) ==");
-    println!("reason,count,share,sum_total_pnl,avg_total_pnl,miss_rate");
+    println!("reason,count,share,sum_total_pnl,avg_set_ratio,avg_fill_ratio");
     let denom = a.rows_ok.max(1) as f64;
 
     let mut rows: Vec<_> = a.by_reason.iter().collect();
@@ -525,32 +672,32 @@ fn print_reason_section(a: &ShadowAnalysis) {
     for (reason, agg) in rows {
         let share = (agg.count as f64) / denom;
         println!(
-            "{},{},{:.3},{:.6},{:.6},{:.3}",
+            "{},{},{:.3},{:.6},{:.6},{:.6}",
             reason,
             agg.count,
             share,
             agg.sum_total_pnl,
-            agg.avg_total_pnl(),
-            agg.miss_rate()
+            agg.avg_set_ratio(),
+            agg.avg_fill_ratio()
         );
     }
     println!();
 
     println!("== Reasons x Bucket ==");
-    println!("reason,bucket,count,share,sum_total_pnl,avg_total_pnl,miss_rate");
+    println!("reason,bucket,count,share,sum_total_pnl,avg_set_ratio,avg_fill_ratio");
     let mut rows: Vec<_> = a.by_reason_bucket.iter().collect();
     rows.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
     for ((reason, bucket), agg) in rows {
         let share = (agg.count as f64) / denom;
         println!(
-            "{},{},{},{:.3},{:.6},{:.6},{:.3}",
+            "{},{},{},{:.3},{:.6},{:.6},{:.6}",
             reason,
             bucket,
             agg.count,
             share,
             agg.sum_total_pnl,
-            agg.avg_total_pnl(),
-            agg.miss_rate()
+            agg.avg_set_ratio(),
+            agg.avg_fill_ratio()
         );
     }
     println!();
@@ -598,6 +745,27 @@ fn print_combo_section(map: &BTreeMap<(String, String, String), Agg>) {
     println!();
 }
 
+fn print_cycle_section(map: &BTreeMap<String, CycleAgg>) {
+    println!("== Top Losing Cycles (Worst 20) ==");
+    println!("cycle_id,count_signals,sum_total_pnl,worst_reason");
+    let mut rows: Vec<_> = map.iter().collect();
+    rows.sort_by(|a, b| {
+        a.1.sum_total_pnl
+            .partial_cmp(&b.1.sum_total_pnl)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (cycle_id, agg) in rows.into_iter().take(20) {
+        println!(
+            "{},{},{:.6},{}",
+            cycle_id, agg.count_signals, agg.sum_total_pnl, agg.worst_reason
+        );
+    }
+    if map.is_empty() {
+        println!("(empty)");
+    }
+    println!();
+}
+
 fn print_tail_slice_section(tail: &[TailRow]) {
     println!("== Tail Risk Slice (Worst 20) ==");
     println!(
@@ -622,21 +790,6 @@ fn print_tail_slice_section(tail: &[TailRow]) {
         println!("(empty)");
     }
     println!();
-}
-
-fn canonical_notes_key(notes: &str) -> String {
-    let notes = notes.trim();
-    if notes.is_empty() {
-        return "OK".to_string();
-    }
-    let mut parts = parse_notes_reasons(notes);
-    parts.sort();
-    parts.dedup();
-    if parts.is_empty() {
-        "OK".to_string()
-    } else {
-        parts.join(",")
-    }
 }
 
 fn set_ratio_quantiles(samples: &[f64]) -> (f64, f64, f64) {
@@ -772,8 +925,18 @@ mod tests {
         cols[idx("pnl_left_total")] = "0.0".to_string();
         cols[idx("set_ratio")] = set_ratio.to_string();
         cols[idx("q_set")] = "1.0".to_string();
+        cols[idx("q_fill_avg")] = "1.0".to_string();
         cols[idx("q_req")] = "1.0".to_string();
         cols[idx("legs_n")] = "2".to_string();
+        cols[idx("leg0_p_limit")] = "0.5".to_string();
+        cols[idx("leg0_best_bid")] = "0.49".to_string();
+        cols[idx("leg0_q_fill")] = "1.0".to_string();
+        cols[idx("leg1_p_limit")] = "0.5".to_string();
+        cols[idx("leg1_best_bid")] = "0.49".to_string();
+        cols[idx("leg1_q_fill")] = "1.0".to_string();
+        cols[idx("leg2_p_limit")] = "0.0".to_string();
+        cols[idx("leg2_best_bid")] = "0.0".to_string();
+        cols[idx("leg2_q_fill")] = "0.0".to_string();
         cols[idx("notes")] = if notes.contains(',') {
             format!("\"{}\"", notes.replace('"', "\"\""))
         } else {
