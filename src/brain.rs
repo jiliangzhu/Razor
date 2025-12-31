@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use crate::buckets::classify_bucket;
 use crate::config::Config;
 use crate::health::HealthCounters;
-use crate::reasons::ShadowNoteReason;
+use crate::reasons::Reason;
 use crate::types::{
     now_ms, now_us, Bps, Bucket, BucketMetrics, Leg, MarketDef, MarketSnapshot, Side, Signal,
     Strategy,
@@ -39,7 +39,53 @@ struct EvalMetrics {
     expected_net_bps: Bps,
     bucket_metrics: BucketMetrics,
     worst_leg_token_id: String,
-    reasons: Vec<ShadowNoteReason>,
+    reasons: Vec<Reason>,
+}
+
+#[derive(Clone, Debug)]
+struct MarketMeta {
+    market_slug: Option<String>,
+    market_type: Option<String>,
+    round_start_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundGateStatus {
+    Pass,
+    Blocked,
+    SkipNoRoundInfo,
+    SkipDisabled,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RoundGate {
+    enabled: bool,
+    round_window_min: u64,
+}
+
+impl RoundGate {
+    pub fn new(enabled: bool, round_window_min: u64) -> Self {
+        Self {
+            enabled,
+            round_window_min,
+        }
+    }
+
+    pub fn status(self, now_ms: u64, round_start_ms: Option<u64>) -> RoundGateStatus {
+        if !self.enabled || self.round_window_min == 0 {
+            return RoundGateStatus::SkipDisabled;
+        }
+        let Some(start_ms) = round_start_ms else {
+            return RoundGateStatus::SkipNoRoundInfo;
+        };
+        let elapsed_ms = now_ms.saturating_sub(start_ms);
+        let elapsed_min = elapsed_ms / 60_000;
+        if elapsed_min > self.round_window_min {
+            RoundGateStatus::Blocked
+        } else {
+            RoundGateStatus::Pass
+        }
+    }
 }
 
 pub async fn run(
@@ -53,15 +99,27 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut next_signal_id: u64 = 1;
     let mut last_by_key: HashMap<(String, Strategy, i32), LastSignalState> = HashMap::new();
+    let mut cycle_seq_by_key: HashMap<(String, Strategy), u64> = HashMap::new();
     let cooldown_ms = cfg.brain.signal_cooldown_ms;
     let min_net_edge = Bps::new(cfg.brain.min_net_edge_bps);
     let mut last_prune_ms: u64 = 0;
     const DEDUP_PRUNE_EVERY_MS: u64 = 60_000;
     const DEDUP_TTL_MS: u64 = 60 * 60_000;
+    let round_gate = RoundGate::new(cfg.brain.enable_round_gate, cfg.brain.round_window_min);
 
     let mut supported: HashMap<String, usize> = HashMap::new();
+    let mut market_meta: HashMap<String, MarketMeta> = HashMap::new();
     for m in markets {
-        supported.insert(m.market_id, m.token_ids.len());
+        let market_id = m.market_id.clone();
+        supported.insert(market_id.clone(), m.token_ids.len());
+        market_meta.insert(
+            market_id,
+            MarketMeta {
+                market_slug: m.market_slug.clone(),
+                market_type: m.market_type.clone(),
+                round_start_ms: m.round_start_ms,
+            },
+        );
     }
 
     loop {
@@ -127,6 +185,21 @@ pub async fn run(
             }
         };
 
+        let gate_status = round_gate.status(
+            signal_ts_ms,
+            market_meta
+                .get(&snap.market_id)
+                .and_then(|meta| meta.round_start_ms),
+        );
+        if gate_status == RoundGateStatus::Blocked {
+            debug!(
+                market_id = %snap.market_id,
+                reason = %Reason::RoundGateBlocked,
+                "skip: round gate blocked"
+            );
+            continue;
+        }
+
         let rounded_cost_bps = (metrics.raw_cost_bps.raw() / 2) * 2;
         let key = (snap.market_id.clone(), metrics.strategy, rounded_cost_bps);
 
@@ -182,12 +255,29 @@ pub async fn run(
 
         let signal_id = next_signal_id;
         next_signal_id += 1;
-
+        let cycle_seq = cycle_seq_by_key
+            .entry((snap.market_id.clone(), metrics.strategy))
+            .and_modify(|v| *v += 1)
+            .or_insert(1);
+        let cycle_id = format!(
+            "{}:{}:{}:{}",
+            run_id,
+            snap.market_id,
+            metrics.strategy.as_str(),
+            cycle_seq
+        );
+        let (market_slug, market_type) = market_meta
+            .get(&snap.market_id)
+            .map(|meta| (meta.market_slug.clone(), meta.market_type.clone()))
+            .unwrap_or((None, None));
         let signal = Signal {
             run_id: run_id.clone(),
             signal_id,
             signal_ts_ms,
             market_id: snap.market_id.clone(),
+            cycle_id,
+            market_slug,
+            market_type,
             strategy: metrics.strategy,
             bucket: metrics.bucket,
             reasons: metrics.reasons.clone(),
@@ -200,6 +290,8 @@ pub async fn run(
             bucket_metrics: metrics.bucket_metrics.clone(),
             legs,
         };
+        let log_market_slug = signal.market_slug.clone();
+        let log_market_type = signal.market_type.clone();
 
         last_by_key.insert(
             key,
@@ -215,6 +307,8 @@ pub async fn run(
                 info!(
                     signal_id,
                     market_id = %snap.market_id,
+                    market_slug = ?log_market_slug,
+                    market_type = ?log_market_type,
                     bucket = %metrics.bucket.as_str(),
                     strategy = %metrics.strategy.as_str(),
                     worst_leg_token_id = %metrics.worst_leg_token_id,
@@ -345,6 +439,8 @@ mod tests {
                 q_req: 10.0,
                 signal_cooldown_ms: 0,
                 max_snapshot_staleness_ms: 500,
+                enable_round_gate: false,
+                round_window_min: 0,
             },
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),
@@ -444,6 +540,8 @@ mod tests {
                 q_req: 10.0,
                 signal_cooldown_ms: 0,
                 max_snapshot_staleness_ms: 500,
+                enable_round_gate: false,
+                round_window_min: 0,
             },
             buckets: BucketConfig::default(),
             shadow: ShadowConfig::default(),

@@ -1,10 +1,13 @@
+pub mod brain;
 pub mod buckets;
 pub mod config;
+pub mod health;
 pub mod market_select;
 pub mod reasons;
 pub mod recorder;
 pub mod report;
 pub mod run_meta;
 pub mod schema;
+pub mod shadow;
 pub mod trade_store;
 pub mod types;

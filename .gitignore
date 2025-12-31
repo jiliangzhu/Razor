@@ -1,6 +1,6 @@
 target/
 data/
 config.toml
+!config/config.toml
 *.log
 .DS_Store
-

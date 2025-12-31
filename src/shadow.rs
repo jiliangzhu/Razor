@@ -9,13 +9,77 @@ use tracing::{debug, info};
 use crate::buckets::fill_share_p25;
 use crate::config::Config;
 use crate::health::HealthCounters;
-use crate::reasons::{format_notes, ShadowNoteReason};
+use crate::reasons::{format_notes, Reason};
 use crate::recorder::{CsvAppender, SHADOW_HEADER};
 use crate::schema::{DUMP_SLIPPAGE_ASSUMED, SCHEMA_VERSION};
 use crate::trade_store::TradeStore;
 use crate::types::{now_ms, Bps, Leg, MarketDef, Side, Signal, TradeTick};
 
 const LEFTOVER_DUMP_MULT: f64 = 1.0 - DUMP_SLIPPAGE_ASSUMED;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DedupKey {
+    market_id: String,
+    strategy: crate::types::Strategy,
+    bucket: crate::types::Bucket,
+    worst_leg_token_id: String,
+    q_req_bits: u64,
+    legs_n: u8,
+    signal_ts_sec: u64,
+}
+
+impl DedupKey {
+    fn new(
+        market_id: &str,
+        strategy: crate::types::Strategy,
+        bucket: crate::types::Bucket,
+        worst_leg_token_id: &str,
+        q_req: f64,
+        legs_n: u8,
+        signal_ts_sec: u64,
+    ) -> Self {
+        Self {
+            market_id: market_id.to_string(),
+            strategy,
+            bucket,
+            worst_leg_token_id: worst_leg_token_id.to_string(),
+            q_req_bits: q_req.to_bits(),
+            legs_n,
+            signal_ts_sec,
+        }
+    }
+}
+
+fn select_primary_reason(reasons: &[Reason]) -> Reason {
+    if reasons.is_empty() {
+        return Reason::Ok;
+    }
+    let priority = [
+        Reason::DedupHit,
+        Reason::RoundGateBlocked,
+        Reason::InvalidSignal,
+        Reason::InvalidQty,
+        Reason::InvalidPrice,
+        Reason::LegsMismatch,
+        Reason::BucketLiquidNan,
+        Reason::BucketThinNan,
+        Reason::MissingBid,
+        Reason::MissingBook,
+        Reason::WindowEmpty,
+        Reason::NoTrades,
+        Reason::WindowDataGap,
+        Reason::FillShareP25Zero,
+        Reason::SignalTooOld,
+        Reason::DepthUnitSuspect,
+        Reason::InternalError,
+    ];
+    for p in priority {
+        if reasons.contains(&p) {
+            return p;
+        }
+    }
+    Reason::Ok
+}
 
 pub async fn run(
     cfg: Config,
@@ -33,7 +97,7 @@ pub async fn run(
 
     let mut store = TradeStore::new_with_cap(cfg.shadow.trade_retention_ms, cfg.shadow.max_trades);
     let mut pending: Vec<Signal> = Vec::new();
-    let mut last_written_signal_id: u64 = 0;
+    let mut dedup: std::collections::HashSet<DedupKey> = std::collections::HashSet::new();
 
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -48,7 +112,7 @@ pub async fn run(
                         &mut out,
                         &store,
                         &mut pending,
-                        &mut last_written_signal_id,
+                        &mut dedup,
                         now,
                         window_start_ms,
                         window_end_ms,
@@ -80,7 +144,7 @@ pub async fn run(
                     &mut out,
                     &store,
                     &mut pending,
-                    &mut last_written_signal_id,
+                    &mut dedup,
                     now,
                     window_start_ms,
                     window_end_ms,
@@ -100,7 +164,7 @@ fn settle_ready(
     out: &mut CsvAppender,
     store: &TradeStore,
     pending: &mut Vec<Signal>,
-    last_written_signal_id: &mut u64,
+    dedup: &mut std::collections::HashSet<DedupKey>,
     now_ms: u64,
     window_start_ms: u64,
     window_end_ms: u64,
@@ -111,22 +175,14 @@ fn settle_ready(
     }
 
     let mut still_pending = Vec::with_capacity(pending.len());
-    for mut s in pending.drain(..) {
+    for s in pending.drain(..) {
         if now_ms < s.signal_ts_ms + window_end_ms {
             still_pending.push(s);
             continue;
         }
-
-        let is_dup = s.signal_id <= *last_written_signal_id;
-        if is_dup {
-            s.reasons.push(ShadowNoteReason::DedupHit);
-        }
-
-        if let Err(e) = settle_one(cfg, out, store, &s, window_start_ms, window_end_ms) {
+        if let Err(e) = settle_one(cfg, out, store, dedup, &s, window_start_ms, window_end_ms) {
             tracing::warn!(signal_id = s.signal_id, market_id = %s.market_id, error = %e, "shadow settle error");
             write_internal_error_row(cfg, out, &s, window_start_ms, window_end_ms)?;
-        } else if !is_dup {
-            *last_written_signal_id = s.signal_id;
         }
 
         health.set_last_shadow_write_ms(now_ms);
@@ -158,7 +214,7 @@ fn write_internal_error_row(
         });
     }
 
-    let notes = format_notes(&[ShadowNoteReason::InternalError]);
+    let notes = format_notes(Reason::InternalError, &s.cycle_id);
 
     let mut record: Vec<String> = Vec::with_capacity(SHADOW_HEADER.len());
     record.push(s.run_id.clone());
@@ -203,6 +259,7 @@ fn settle_one(
     cfg: &Config,
     out: &mut CsvAppender,
     store: &TradeStore,
+    dedup: &mut std::collections::HashSet<DedupKey>,
     s: &Signal,
     window_start_ms: u64,
     window_end_ms: u64,
@@ -210,7 +267,6 @@ fn settle_one(
     let start_ms = s.signal_ts_ms + window_start_ms;
     let end_ms = s.signal_ts_ms + window_end_ms;
 
-    let fill_share_used = fill_share_p25(s.bucket, &cfg.buckets);
     let window_stats = store.window_stats(&s.market_id, start_ms, end_ms);
 
     let legs_n = s.legs.len();
@@ -219,7 +275,32 @@ fn settle_one(
     let mut legs_sorted = s.legs.clone();
     legs_sorted.sort_by_key(|l| l.leg_index);
 
-    let mut reasons: Vec<ShadowNoteReason> = s.reasons.clone();
+    let mut reasons: Vec<Reason> = s.reasons.clone();
+    let mut bucket_nan = reasons
+        .iter()
+        .any(|r| matches!(r, Reason::BucketThinNan | Reason::BucketLiquidNan));
+    let mut worst_leg_token_id = if bucket_nan {
+        String::new()
+    } else {
+        legs_sorted
+            .iter()
+            .find(|l| l.leg_index == s.bucket_metrics.worst_leg_index)
+            .map(|l| l.token_id.clone())
+            .unwrap_or_default()
+    };
+    if worst_leg_token_id.is_empty() {
+        match s.bucket {
+            crate::types::LiquidityBucket::Liquid => reasons.push(Reason::BucketLiquidNan),
+            crate::types::LiquidityBucket::Thin => reasons.push(Reason::BucketThinNan),
+        }
+        bucket_nan = true;
+    }
+    let bucket_for_record = if bucket_nan {
+        crate::types::LiquidityBucket::Thin
+    } else {
+        s.bucket
+    };
+    let mut fill_share_used = fill_share_p25(bucket_for_record, &cfg.buckets);
 
     let mut v_mkt: Vec<f64> = vec![0.0; legs_n.min(3)];
     let mut q_fill: Vec<f64> = vec![0.0; legs_n.min(3)];
@@ -320,12 +401,15 @@ fn settle_one(
         0.0
     };
 
+    let mut invalid_signal = false;
     if legs_n != 2 && legs_n != 3 {
-        reasons.push(ShadowNoteReason::LegsMismatch);
+        reasons.push(Reason::LegsMismatch);
+        invalid_signal = true;
     }
 
     if !s.q_req.is_finite() || s.q_req <= 0.0 {
-        reasons.push(ShadowNoteReason::InvalidQty);
+        reasons.push(Reason::InvalidQty);
+        invalid_signal = true;
     }
 
     if legs
@@ -333,71 +417,73 @@ fn settle_one(
         .take(legs_n.min(3))
         .any(|l| !l.qty.is_finite() || l.qty <= 0.0)
     {
-        reasons.push(ShadowNoteReason::InvalidQty);
+        reasons.push(Reason::InvalidQty);
+        invalid_signal = true;
     }
 
     if !bid_missing_legs.is_empty() {
-        reasons.push(ShadowNoteReason::MissingBid);
+        reasons.push(Reason::MissingBid);
     }
 
     if !book_missing_legs.is_empty() {
-        reasons.push(ShadowNoteReason::MissingBook);
+        reasons.push(Reason::MissingBook);
     }
 
     if invalid_limit {
-        reasons.push(ShadowNoteReason::InvalidPrice);
+        reasons.push(Reason::InvalidPrice);
+        invalid_signal = true;
+    }
+
+    if invalid_signal {
+        reasons.push(Reason::InvalidSignal);
     }
 
     let v_mkt_sum: f64 = v_mkt.iter().copied().sum();
     if window_stats.trades_in_window == 0 {
-        reasons.push(ShadowNoteReason::WindowEmpty);
+        reasons.push(Reason::WindowEmpty);
     }
 
     if cfg.shadow.max_trade_gap_ms > 0
         && window_stats.trades_in_window > 1
         && window_stats.max_gap_ms > cfg.shadow.max_trade_gap_ms
     {
-        reasons.push(ShadowNoteReason::WindowDataGap);
+        reasons.push(Reason::WindowDataGap);
     }
 
     if v_mkt_sum <= 0.0 {
-        reasons.push(ShadowNoteReason::NoTrades);
+        reasons.push(Reason::NoTrades);
     }
 
     if fill_share_used <= 0.0 || !fill_share_used.is_finite() {
-        reasons.push(ShadowNoteReason::FillShareP25Zero);
+        reasons.push(Reason::FillShareP25Zero);
     }
 
     if now_ms().saturating_sub(s.signal_ts_ms) > cfg.shadow.trade_retention_ms {
-        reasons.push(ShadowNoteReason::SignalTooOld);
+        reasons.push(Reason::SignalTooOld);
     }
 
-    let bucket_nan = reasons.iter().any(|r| {
-        matches!(
-            r,
-            ShadowNoteReason::BucketThinNan | ShadowNoteReason::BucketLiquidNan
-        )
-    });
-
-    let worst_leg_token_id = if bucket_nan {
-        String::new()
-    } else {
-        legs.iter()
-            .find(|l| l.leg_index == s.bucket_metrics.worst_leg_index)
-            .map(|l| l.token_id.clone())
-            .unwrap_or_default()
-    };
-
-    if worst_leg_token_id.is_empty() {
-        match s.bucket {
-            crate::types::LiquidityBucket::Liquid => {
-                reasons.push(ShadowNoteReason::BucketLiquidNan)
-            }
-            crate::types::LiquidityBucket::Thin => reasons.push(ShadowNoteReason::BucketThinNan),
-        }
+    if bucket_nan {
+        worst_leg_token_id.clear();
+        fill_share_used = fill_share_p25(bucket_for_record, &cfg.buckets);
     }
 
-    let notes = format_notes(&reasons);
+    let dedup_key = DedupKey::new(
+        &s.market_id,
+        s.strategy,
+        bucket_for_record,
+        &worst_leg_token_id,
+        s.q_req,
+        legs_n as u8,
+        s.signal_ts_ms / 1000,
+    );
+    let is_dup = !dedup.insert(dedup_key);
+
+    if is_dup {
+        reasons.push(Reason::DedupHit);
+    }
+
+    let reason = select_primary_reason(&reasons);
+    let notes = format_notes(reason, &s.cycle_id);
 
     let mut record: Vec<String> = Vec::with_capacity(SHADOW_HEADER.len());
     record.push(s.run_id.clone());
@@ -408,7 +494,7 @@ fn settle_one(
     record.push(window_end_ms.to_string());
     record.push(s.market_id.clone());
     record.push(s.strategy.as_str().to_string());
-    record.push(s.bucket.as_str().to_ascii_lowercase());
+    record.push(bucket_for_record.as_str().to_ascii_lowercase());
     record.push(worst_leg_token_id);
     record.push(s.q_req.to_string());
     record.push((legs_n as u8).to_string());
@@ -422,6 +508,11 @@ fn settle_one(
         record.push(q_fill[i].to_string());
     }
 
+    let (pnl_set, pnl_left_total, total_pnl) = if is_dup {
+        (0.0, 0.0, 0.0)
+    } else {
+        (pnl_set, pnl_left_total, total_pnl)
+    };
     record.push(cost_set.to_string());
     record.push(proceeds_set.to_string());
     record.push(pnl_set.to_string());
@@ -472,6 +563,8 @@ mod tests {
                 q_req: 10.0,
                 signal_cooldown_ms: 0,
                 max_snapshot_staleness_ms: 500,
+                enable_round_gate: false,
+                round_window_min: 0,
             },
             buckets: BucketConfig {
                 fill_share_liquid_p25: 0.5,
@@ -495,6 +588,9 @@ mod tests {
             signal_id: 1,
             signal_ts_ms: base_ms,
             market_id: "mkt".to_string(),
+            cycle_id: "run_test:mkt:binary:1".to_string(),
+            market_slug: None,
+            market_type: None,
             strategy: Strategy::Binary,
             bucket: Bucket::Liquid,
             reasons: Vec::new(),
@@ -554,35 +650,63 @@ mod tests {
             trade_id: "t2".to_string(),
         });
 
-        settle_one(&cfg, &mut out, &store, &s, 100, 1_100).expect("settle");
+        let mut dedup = std::collections::HashSet::new();
+        settle_one(&cfg, &mut out, &store, &mut dedup, &s, 100, 1_100).expect("settle");
         out.flush_and_sync().expect("flush");
 
         let text = std::fs::read_to_string(&tmp).expect("read csv");
-        let mut lines = text.lines();
-        let header = lines.next().expect("header");
-        let row = lines.next().expect("row");
-        let names: Vec<&str> = header.split(',').collect();
-        let cols: Vec<&str> = row.split(',').collect();
-        assert_eq!(cols.len(), SHADOW_HEADER.len());
+        let mut rdr = csv::ReaderBuilder::new()
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(text.as_bytes());
+        let header = rdr.headers().expect("header").clone();
+        let record = rdr.records().next().expect("row").expect("row");
 
         let idx = |name: &str| -> usize {
-            names
+            header
                 .iter()
                 .position(|n| n.eq_ignore_ascii_case(name))
                 .unwrap_or_else(|| panic!("missing column {name}"))
         };
 
-        assert_eq!(cols[idx("run_id")], "run_test");
-        assert_eq!(cols[idx("schema_version")], crate::schema::SCHEMA_VERSION);
+        assert_eq!(record.get(idx("run_id")).unwrap_or(""), "run_test");
+        assert_eq!(
+            record.get(idx("schema_version")).unwrap_or(""),
+            crate::schema::SCHEMA_VERSION
+        );
 
-        let q_set: f64 = cols[idx("q_set")].parse().expect("q_set");
-        let q_fill_avg: f64 = cols[idx("q_fill_avg")].parse().expect("q_fill_avg");
-        let set_ratio: f64 = cols[idx("set_ratio")].parse().expect("set_ratio");
-        let pnl_set: f64 = cols[idx("pnl_set")].parse().expect("pnl_set");
-        let pnl_left: f64 = cols[idx("pnl_left_total")].parse().expect("pnl_left_total");
-        let pnl_total: f64 = cols[idx("total_pnl")].parse().expect("total_pnl");
-        let notes = cols[idx("notes")];
-        assert_eq!(notes, "");
+        let q_set: f64 = record
+            .get(idx("q_set"))
+            .unwrap_or("")
+            .parse()
+            .expect("q_set");
+        let q_fill_avg: f64 = record
+            .get(idx("q_fill_avg"))
+            .unwrap_or("")
+            .parse()
+            .expect("q_fill_avg");
+        let set_ratio: f64 = record
+            .get(idx("set_ratio"))
+            .unwrap_or("")
+            .parse()
+            .expect("set_ratio");
+        let pnl_set: f64 = record
+            .get(idx("pnl_set"))
+            .unwrap_or("")
+            .parse()
+            .expect("pnl_set");
+        let pnl_left: f64 = record
+            .get(idx("pnl_left_total"))
+            .unwrap_or("")
+            .parse()
+            .expect("pnl_left_total");
+        let pnl_total: f64 = record
+            .get(idx("total_pnl"))
+            .unwrap_or("")
+            .parse()
+            .expect("total_pnl");
+        let notes = record.get(idx("notes")).unwrap_or("");
+        assert_eq!(notes, "reason=OK,cycle_id=run_test:mkt:binary:1");
 
         // q_fill: A=10, B=6 => q_set=6, q_fill_avg=8, set_ratio=0.75
         assert_approx_eq!(q_set, 6.0, 1e-9);
@@ -621,6 +745,8 @@ mod tests {
                 q_req: 10.0,
                 signal_cooldown_ms: 0,
                 max_snapshot_staleness_ms: 500,
+                enable_round_gate: false,
+                round_window_min: 0,
             },
             buckets: BucketConfig {
                 fill_share_liquid_p25: 0.5,
@@ -646,6 +772,9 @@ mod tests {
             signal_id: 1,
             signal_ts_ms: base_ms,
             market_id: "mkt".to_string(),
+            cycle_id: "run_test:mkt:binary:1".to_string(),
+            market_slug: None,
+            market_type: None,
             strategy: Strategy::Binary,
             bucket: Bucket::Liquid,
             reasons: Vec::new(),
@@ -705,32 +834,46 @@ mod tests {
             trade_id: "t2".to_string(),
         });
 
-        settle_one(&cfg, &mut out, &store, &s, 100, 1_100).expect("settle");
+        let mut dedup = std::collections::HashSet::new();
+        settle_one(&cfg, &mut out, &store, &mut dedup, &s, 100, 1_100).expect("settle");
         out.flush_and_sync().expect("flush");
 
         let text = std::fs::read_to_string(&tmp).expect("read csv");
-        let mut lines = text.lines();
-        let header = lines.next().expect("header");
-        let row = lines.next().expect("row");
-        let names: Vec<&str> = header.split(',').collect();
-        let cols: Vec<&str> = row.split(',').collect();
+        let mut rdr = csv::ReaderBuilder::new()
+            .flexible(true)
+            .trim(csv::Trim::All)
+            .from_reader(text.as_bytes());
+        let header = rdr.headers().expect("header").clone();
+        let record = rdr.records().next().expect("row").expect("row");
 
         let idx = |name: &str| -> usize {
-            names
+            header
                 .iter()
                 .position(|n| n.eq_ignore_ascii_case(name))
                 .unwrap_or_else(|| panic!("missing column {name}"))
         };
 
-        let notes = cols[idx("notes")];
-        assert_eq!(notes, "MISSING_BID");
+        let notes = record.get(idx("notes")).unwrap_or("");
+        assert_eq!(notes, "reason=MISSING_BID,cycle_id=run_test:mkt:binary:1");
 
-        let q_set: f64 = cols[idx("q_set")].parse().expect("q_set");
-        let q_fill0: f64 = cols[idx("leg0_q_fill")].parse().expect("leg0_q_fill");
+        let q_set: f64 = record
+            .get(idx("q_set"))
+            .unwrap_or("")
+            .parse()
+            .expect("q_set");
+        let q_fill0: f64 = record
+            .get(idx("leg0_q_fill"))
+            .unwrap_or("")
+            .parse()
+            .expect("leg0_q_fill");
         let q_left0 = q_fill0 - q_set;
         assert_approx_eq!(q_left0, 4.0, 1e-9);
 
-        let pnl_left_total: f64 = cols[idx("pnl_left_total")].parse().expect("pnl_left_total");
+        let pnl_left_total: f64 = record
+            .get(idx("pnl_left_total"))
+            .unwrap_or("")
+            .parse()
+            .expect("pnl_left_total");
         let expected_cost0 = q_left0 * Bps::FEE_POLY.apply_cost(0.49);
         // exit_price=0 => proceeds=0 => pnl_left_total = -cost_left0
         assert_approx_eq!(pnl_left_total, -expected_cost0, 1e-9);

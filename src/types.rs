@@ -10,7 +10,7 @@ use std::fmt;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::reasons::ShadowNoteReason;
+use crate::reasons::Reason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Bps(pub i32);
@@ -266,9 +266,12 @@ pub struct Signal {
     pub signal_id: u64,
     pub signal_ts_ms: u64,
     pub market_id: String,
+    pub cycle_id: String,
+    pub market_slug: Option<String>,
+    pub market_type: Option<String>,
     pub strategy: Strategy,
     pub bucket: Bucket,
-    pub reasons: Vec<ShadowNoteReason>,
+    pub reasons: Vec<Reason>,
     pub q_req: f64,
     pub raw_cost_bps: Bps,
     pub raw_edge_bps: Bps,
@@ -341,6 +344,9 @@ pub struct BucketMetrics {
 pub struct MarketDef {
     pub market_id: String,
     pub token_ids: Vec<String>,
+    pub market_slug: Option<String>,
+    pub market_type: Option<String>,
+    pub round_start_ms: Option<u64>,
 }
 
 impl MarketDef {

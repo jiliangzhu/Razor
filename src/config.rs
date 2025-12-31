@@ -168,6 +168,10 @@ pub struct BrainConfig {
     #[allow(dead_code)]
     #[serde(default = "default_max_snapshot_staleness_ms")]
     pub max_snapshot_staleness_ms: u64,
+    #[serde(default = "default_enable_round_gate")]
+    pub enable_round_gate: bool,
+    #[serde(default = "default_round_window_min")]
+    pub round_window_min: u64,
 }
 
 impl Default for BrainConfig {
@@ -178,6 +182,8 @@ impl Default for BrainConfig {
             q_req: default_q_req(),
             signal_cooldown_ms: default_signal_cooldown_ms(),
             max_snapshot_staleness_ms: default_max_snapshot_staleness_ms(),
+            enable_round_gate: default_enable_round_gate(),
+            round_window_min: default_round_window_min(),
         }
     }
 }
@@ -200,6 +206,14 @@ fn default_signal_cooldown_ms() -> u64 {
 
 fn default_max_snapshot_staleness_ms() -> u64 {
     500
+}
+
+fn default_enable_round_gate() -> bool {
+    false
+}
+
+fn default_round_window_min() -> u64 {
+    0
 }
 
 #[derive(Clone, Debug, Deserialize)]
