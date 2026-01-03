@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -28,6 +28,8 @@ pub async fn run(
     cfg: Config,
     mut rx: mpsc::Receiver<CalibrationEvent>,
     calibration_log_path: PathBuf,
+    suggest_dir: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut out = CsvAppender::open(calibration_log_path, &CALIBRATION_LOG_HEADER)
         .context("open calibration_log.csv")?;
@@ -49,8 +51,15 @@ pub async fn run(
     let min_n = cfg.calibration.min_samples_per_bucket.max(1);
 
     loop {
-        let Some(ev) = rx.recv().await else {
-            return Err(anyhow::anyhow!("calibration channel closed"));
+        let ev = tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+                continue;
+            }
+            maybe = rx.recv() => maybe,
+        };
+        let Some(ev) = ev else {
+            break;
         };
 
         out.write_record([
@@ -95,7 +104,7 @@ pub async fn run(
         };
 
         write_suggest_toml(
-            &cfg.run.data_dir,
+            &suggest_dir,
             &cfg.calibration.suggest_filename,
             now_ms(),
             liquid_n,
@@ -116,6 +125,9 @@ pub async fn run(
         last_written_liquid = liquid_n;
         last_written_thin = thin_n;
     }
+
+    out.flush_and_sync()?;
+    Ok(())
 }
 
 fn real_share_sample(req_qty: f64, filled_qty: f64) -> Option<f64> {

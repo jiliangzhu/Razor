@@ -75,7 +75,11 @@
 
 ### 4.2 数据质量（是否“能跑通口径”）
 
-以短采样窗口内的 **snapshot 样本** 作为分母（每次 `MarketSnapshot` publish 计 1）。
+以短采样窗口内的 **snapshot 样本** 作为分母。
+
+实现口径冻结：为了控制流量并让不同 market 的 `snapshots_total` 可比，`market_select` 按固定采样间隔对“当前最新快照”取样计数（默认 1Hz）。因此：
+- `snapshots_total` ≈ `probe_seconds / snapshot_sample_interval_seconds`（WS 稳定连接时）
+- recommendation.json 中必须输出 `snapshot_sample_interval_ms` 作为审计锚点（避免误读为“WS publish 次数”）
 
 - `snapshots_total`：发布的 snapshot 数
 - `ticks_total`：tick 样本数（实现时可等同 snapshots_total；或分别统计）

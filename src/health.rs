@@ -125,6 +125,7 @@ pub enum HealthLine {
     Heartbeat(HealthSnapshot),
     TradePollHitLimit {
         ts_ms: u64,
+        market_id: String,
         returned_count: usize,
         earliest_ts_ms: u64,
         latest_ts_ms: u64,

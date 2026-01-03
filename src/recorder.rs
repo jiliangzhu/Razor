@@ -138,6 +138,7 @@ pub struct JsonlAppender {
     pending_lines: usize,
     last_flush_ms: u64,
     rotate_max_bytes: Option<u64>,
+    rotate_keep_files: Option<usize>,
 }
 
 pub struct RecorderGuard {
@@ -153,9 +154,13 @@ impl RecorderGuard {
         let files = [
             crate::schema::FILE_TICKS,
             crate::schema::FILE_TRADES,
+            crate::schema::FILE_SNAPSHOTS,
             crate::schema::FILE_SHADOW_LOG,
             crate::schema::FILE_RAW_WS_JSONL,
             crate::schema::FILE_HEALTH_JSONL,
+            crate::schema::FILE_TRADE_LOG,
+            crate::schema::FILE_CALIBRATION_LOG,
+            crate::schema::FILE_CALIBRATION_SUGGEST,
             crate::schema::FILE_REPORT_JSON,
             crate::schema::FILE_REPORT_MD,
             crate::schema::FILE_SCHEMA_VERSION,
@@ -201,12 +206,13 @@ fn schema_mismatch_backup_path(path: &Path) -> anyhow::Result<PathBuf> {
 
 impl JsonlAppender {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        Self::open_with_rotation(path, None)
+        Self::open_with_rotation(path, None, None)
     }
 
     pub fn open_with_rotation(
         path: impl AsRef<Path>,
         rotate_max_bytes: Option<u64>,
+        rotate_keep_files: Option<usize>,
     ) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let file = OpenOptions::new()
@@ -220,6 +226,7 @@ impl JsonlAppender {
             pending_lines: 0,
             last_flush_ms: now_ms(),
             rotate_max_bytes,
+            rotate_keep_files,
         })
     }
 
@@ -297,8 +304,61 @@ impl JsonlAppender {
             .open(&self.path)
             .with_context(|| format!("reopen {}", self.path.display()))?;
         self.out = BufWriter::new(file);
+
+        if let Some(keep) = self.rotate_keep_files {
+            if keep > 0 {
+                cleanup_rotated_files(&self.path, keep)?;
+            }
+        }
         Ok(())
     }
+}
+
+fn cleanup_rotated_files(path: &Path, keep: usize) -> anyhow::Result<()> {
+    if keep == 0 {
+        return Ok(());
+    }
+
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let base = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if base.is_empty() {
+        return Ok(());
+    }
+    let prefix = format!("{base}.rotated_");
+
+    let mut rotated: Vec<(u128, PathBuf)> = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let ts = name
+            .strip_prefix(&prefix)
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        rotated.push((ts, entry.path()));
+    }
+
+    if rotated.len() <= keep {
+        return Ok(());
+    }
+    rotated.sort_by_key(|(ts, _)| *ts);
+
+    let remove_n = rotated.len().saturating_sub(keep);
+    for (_ts, p) in rotated.into_iter().take(remove_n) {
+        let _ = std::fs::remove_file(&p);
+        warn!(path = %p.display(), keep, "removed old rotated jsonl segment");
+    }
+    Ok(())
 }
 
 fn rotated_path(path: &Path) -> anyhow::Result<PathBuf> {

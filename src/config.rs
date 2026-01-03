@@ -53,6 +53,38 @@ impl Config {
         if self.shadow.trade_poll_limit == 0 {
             anyhow::bail!("invalid shadow.trade_poll_limit=0 (must be > 0)");
         }
+        if self.run.snapshot_log_interval_ms == 0 {
+            anyhow::bail!("invalid run.snapshot_log_interval_ms=0 (must be > 0)");
+        }
+        if !self.brain.q_req.is_finite() || self.brain.q_req <= 0.0 {
+            anyhow::bail!(
+                "invalid brain.q_req (must be finite and > 0), got {}",
+                self.brain.q_req
+            );
+        }
+
+        // Bps domain safety: prevent extreme config values from overflowing `Bps` arithmetic.
+        // Phase 1 budgets/thresholds are expected to be within [0, 10000].
+        fn check_bps_nonneg(name: &str, v: i32) -> anyhow::Result<()> {
+            if !(0..=10_000).contains(&v) {
+                anyhow::bail!("{name} must be in [0, 10000] bps, got {v}");
+            }
+            Ok(())
+        }
+
+        check_bps_nonneg("brain.risk_premium_bps", self.brain.risk_premium_bps)?;
+        check_bps_nonneg("brain.min_net_edge_bps", self.brain.min_net_edge_bps)?;
+
+        // Live/SIM fields should also stay within sane bps bounds (even though Phase 1 won't place
+        // real orders).
+        check_bps_nonneg("live.chase_cap_bps", self.live.chase_cap_bps)?;
+        check_bps_nonneg("live.ladder_step1_bps", self.live.ladder_step1_bps)?;
+        check_bps_nonneg("live.flatten_lvl1_bps", self.live.flatten_lvl1_bps)?;
+        check_bps_nonneg("live.flatten_lvl2_bps", self.live.flatten_lvl2_bps)?;
+        check_bps_nonneg("live.flatten_lvl3_bps", self.live.flatten_lvl3_bps)?;
+        if self.shadow.max_trades == 0 {
+            anyhow::bail!("invalid shadow.max_trades=0 (must be > 0)");
+        }
 
         // Fill shares must be finite and within [0, 1].
         fn check_share(name: &str, v: f64) -> anyhow::Result<()> {
@@ -72,6 +104,22 @@ impl Config {
         check_share("sim.sim_fill_share_liquid", self.sim.sim_fill_share_liquid)?;
         check_share("sim.sim_fill_share_thin", self.sim.sim_fill_share_thin)?;
 
+        fn check_nonneg(name: &str, v: f64) -> anyhow::Result<()> {
+            if !v.is_finite() || v < 0.0 {
+                anyhow::bail!("{name} must be finite and >= 0, got {v}");
+            }
+            Ok(())
+        }
+
+        check_nonneg(
+            "shadow.trade_size_suspect_threshold",
+            self.shadow.trade_size_suspect_threshold,
+        )?;
+        check_nonneg(
+            "shadow.trade_notional_suspect_threshold",
+            self.shadow.trade_notional_suspect_threshold,
+        )?;
+
         Ok(())
     }
 }
@@ -84,6 +132,9 @@ pub struct PolymarketConfig {
     pub ws_base: String,
     #[serde(default = "default_data_api_base")]
     pub data_api_base: String,
+    /// Polymarket CLOB HTTP API base.
+    #[serde(default = "default_clob_base")]
+    pub clob_base: String,
     /// Default timeout applied to all HTTP requests (ms).
     #[serde(default = "default_http_timeout_ms")]
     pub http_timeout_ms: u64,
@@ -104,6 +155,7 @@ impl Default for PolymarketConfig {
             gamma_base: default_gamma_base(),
             ws_base: default_ws_base(),
             data_api_base: default_data_api_base(),
+            clob_base: default_clob_base(),
             http_timeout_ms: default_http_timeout_ms(),
             http_connect_timeout_ms: default_http_connect_timeout_ms(),
             ws_connect_timeout_ms: default_ws_connect_timeout_ms(),
@@ -122,6 +174,10 @@ fn default_ws_base() -> String {
 
 fn default_data_api_base() -> String {
     "https://data-api.polymarket.com".to_string()
+}
+
+fn default_clob_base() -> String {
+    "https://clob.polymarket.com".to_string()
 }
 
 fn default_http_timeout_ms() -> u64 {
@@ -145,10 +201,25 @@ pub struct RunConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
     pub market_ids: Vec<String>,
+    /// Optional: snapshot log sampling interval (ms) for `snapshots.csv`.
+    #[serde(default = "default_snapshot_log_interval_ms")]
+    pub snapshot_log_interval_ms: u64,
+    /// Keep at most this many rotated `raw_ws.jsonl` segments (best-effort).
+    /// `0` disables cleanup (unbounded disk usage).
+    #[serde(default = "default_raw_ws_rotate_keep")]
+    pub raw_ws_rotate_keep: usize,
 }
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from("data")
+}
+
+fn default_snapshot_log_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_raw_ws_rotate_keep() -> usize {
+    8
 }
 
 fn default_schema_version() -> String {
@@ -246,6 +317,14 @@ pub struct ShadowConfig {
     #[allow(dead_code)]
     #[serde(default = "default_shadow_max_trade_gap_ms")]
     pub max_trade_gap_ms: u64,
+    /// If > 0, marks a shadow row with `TRADE_SIZE_SUSPECT` when any single trade in the
+    /// window exceeds this `size` threshold (unit is data-api `trade.size`).
+    #[serde(default = "default_trade_size_suspect_threshold")]
+    pub trade_size_suspect_threshold: f64,
+    /// If > 0, marks a shadow row with `TRADE_SIZE_SUSPECT` when any single trade in the
+    /// window has `price * size` exceeding this threshold (USDC notional).
+    #[serde(default = "default_trade_notional_suspect_threshold")]
+    pub trade_notional_suspect_threshold: f64,
 }
 
 impl Default for ShadowConfig {
@@ -259,6 +338,8 @@ impl Default for ShadowConfig {
             trade_retention_ms: default_trade_retention_ms(),
             max_trades: default_shadow_max_trades(),
             max_trade_gap_ms: default_shadow_max_trade_gap_ms(),
+            trade_size_suspect_threshold: default_trade_size_suspect_threshold(),
+            trade_notional_suspect_threshold: default_trade_notional_suspect_threshold(),
         }
     }
 }
@@ -293,6 +374,14 @@ fn default_shadow_max_trades() -> usize {
 
 fn default_shadow_max_trade_gap_ms() -> u64 {
     700
+}
+
+fn default_trade_size_suspect_threshold() -> f64 {
+    50_000.0
+}
+
+fn default_trade_notional_suspect_threshold() -> f64 {
+    50_000.0
 }
 
 #[allow(dead_code)]
@@ -365,6 +454,17 @@ fn default_report_min_avg_set_ratio() -> f64 {
 pub struct LiveConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Polygon chain id used for CLOB auth & EIP712 order signing.
+    #[serde(default = "default_live_chain_id")]
+    pub chain_id: u64,
+    /// Env var name holding the Polygon private key (hex, 32 bytes).
+    ///
+    /// This is only read when `RAZOR_MODE=live` and `live.enabled=true`.
+    #[serde(default = "default_live_private_key_env")]
+    pub private_key_env: String,
+    /// API key nonce. `0` is the default identity.
+    #[serde(default = "default_live_api_key_nonce")]
+    pub api_key_nonce: u64,
     #[serde(default = "default_live_chase_cap_bps")]
     pub chase_cap_bps: i32,
     #[serde(default = "default_live_ladder_step1_bps")]
@@ -385,6 +485,9 @@ impl Default for LiveConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            chain_id: default_live_chain_id(),
+            private_key_env: default_live_private_key_env(),
+            api_key_nonce: default_live_api_key_nonce(),
             chase_cap_bps: default_live_chase_cap_bps(),
             ladder_step1_bps: default_live_ladder_step1_bps(),
             flatten_lvl1_bps: default_live_flatten_lvl1_bps(),
@@ -394,6 +497,18 @@ impl Default for LiveConfig {
             cooldown_ms: default_live_cooldown_ms(),
         }
     }
+}
+
+fn default_live_chain_id() -> u64 {
+    137
+}
+
+fn default_live_private_key_env() -> String {
+    "POLYGON_PRIVATE_KEY".to_string()
+}
+
+fn default_live_api_key_nonce() -> u64 {
+    0
 }
 
 fn default_live_chase_cap_bps() -> i32 {

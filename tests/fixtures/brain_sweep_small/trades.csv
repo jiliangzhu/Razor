@@ -1,0 +1,6 @@
+ts_ms,market_id,token_id,price,size,trade_id,ingest_ts_ms,exchange_ts_ms
+1200,m,A,0.48,30,t1,1200,1199
+1300,m,B,0.49,10,t2,1300,1299
+5200,m,A,0.45,30,t3,5200,5199
+5300,m,B,0.45,30,t4,5300,5299
+

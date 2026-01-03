@@ -7,6 +7,10 @@ data_api_base = "https://data-api.polymarket.com"
 data_dir = "data"
 # Gamma market IDs (supports 2-leg binary or 3-leg triangle only)
 market_ids = ["516861"]
+# Optional: snapshot sampling interval for `snapshots.csv` (ms)
+snapshot_log_interval_ms = 1000
+# Keep at most N rotated `raw_ws.jsonl` segments (0 disables cleanup)
+raw_ws_rotate_keep = 8
 
 [brain]
 risk_premium_bps = 80
@@ -25,6 +29,21 @@ trade_poll_interval_ms = 1000
 trade_poll_limit = 500
 trade_poll_taker_only = true
 trade_retention_ms = 5000
+max_trades = 200000
+max_trade_gap_ms = 700
+# Diagnostics only (does not change accounting): emit TRADE_SIZE_SUSPECT when exceeded.
+trade_size_suspect_threshold = 50000.0
+trade_notional_suspect_threshold = 50000.0
+
+[report]
+min_total_shadow_pnl = 0.0
+min_avg_set_ratio = 0.85
+
+[market_select]
+probe_seconds = 3600
+pool_limit = 200
+prefer_strategy = "any"
+max_concurrency = 5
 
 [live]
 # PR-B: must remain false (SIM live only; no real orders)

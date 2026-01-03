@@ -7,6 +7,7 @@ use crate::reasons::ShadowNoteReason;
 use crate::types::{Bps, Bucket};
 
 pub const BUCKET_AFTER_DEGRADE: &str = "thin";
+pub const SNAPSHOT_SAMPLE_INTERVAL_MS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

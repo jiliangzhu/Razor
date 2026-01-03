@@ -1,9 +1,15 @@
 mod brain;
 mod buckets;
+mod calibration;
+mod clob;
+mod clob_order;
 mod config;
+mod eth;
+mod execution;
 mod feed;
 mod graceful_shutdown;
 mod health;
+mod json_util;
 mod reasons;
 mod recorder;
 mod report;
@@ -11,6 +17,10 @@ mod run_context;
 mod run_meta;
 mod schema;
 mod shadow;
+#[allow(dead_code)]
+mod shadow_sweep;
+mod snapshot_logger;
+mod sniper;
 mod trade_store;
 mod types;
 
@@ -21,18 +31,19 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::calibration::CalibrationEvent;
 use crate::types::{MarketSnapshot, Signal, Strategy, TradeTick};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "razor",
     version,
-    about = "Project Razor Phase 1 (dry-run only)"
+    about = "Project Razor (Phase 1 dry-run; Phase 2 live-sim)"
 )]
 struct Args {
     #[arg(long, default_value = "config/config.toml")]
     config: String,
-    /// Override mode (Phase 1 only supports `dry_run`).
+    /// Override mode (`dry_run` or `live`).
     #[arg(long)]
     mode: Option<String>,
 }
@@ -77,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         trade_ts_source: "local".to_string(),
         notes_enum_version: "v1".to_string(),
         trade_poll_taker_only: Some(cfg.shadow.trade_poll_taker_only),
+        sim_stress: sim_stress_profile_from_env(),
     }
     .write_to_dir(&run_ctx.run_dir)
     .context("write run_meta.json")?;
@@ -92,6 +104,12 @@ async fn main() -> anyhow::Result<()> {
         %mode,
         "run start"
     );
+
+    if matches!(mode, Mode::LiveSim) && cfg.live.enabled && !env_flag("RAZOR_LIVE_CONFIRM") {
+        return Err(anyhow!(
+            "refusing to start: live.enabled=true requires RAZOR_LIVE_CONFIRM=1 (safety gate)"
+        ));
+    }
 
     let markets = feed::fetch_markets(&cfg).await.context("fetch markets")?;
     let (mut binary, mut triangle) = (0usize, 0usize);
@@ -110,13 +128,15 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (trade_tx, trade_rx) = mpsc::channel::<TradeTick>(50_000);
-    let (signal_tx, signal_rx) = mpsc::channel::<Signal>(10_000);
     let (snap_tx, snap_rx) = watch::channel::<Option<MarketSnapshot>>(None);
 
     let ticks_path = run_ctx.run_dir.join(schema::FILE_TICKS);
     let trades_path = run_ctx.run_dir.join(schema::FILE_TRADES);
+    let snapshots_path = run_ctx.run_dir.join(schema::FILE_SNAPSHOTS);
     let shadow_path = run_ctx.run_dir.join(schema::FILE_SHADOW_LOG);
     let raw_ws_path = run_ctx.run_dir.join(schema::FILE_RAW_WS_JSONL);
+    let trade_log_path = run_ctx.run_dir.join(schema::FILE_TRADE_LOG);
+    let calibration_log_path = run_ctx.run_dir.join(schema::FILE_CALIBRATION_LOG);
 
     let (shutdown_tx, shutdown_rx) = graceful_shutdown::channel();
 
@@ -138,6 +158,13 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx.clone(),
     ));
 
+    let snapshots_handle = tokio::spawn(snapshot_logger::run_snapshot_logger(
+        snapshots_path,
+        snap_rx.clone(),
+        cfg.run.snapshot_log_interval_ms,
+        shutdown_rx.clone(),
+    ));
+
     let trades_handle = tokio::spawn(feed::run_trades_poller(
         cfg.clone(),
         markets.clone(),
@@ -145,16 +172,6 @@ async fn main() -> anyhow::Result<()> {
         trades_path,
         health_counters.clone(),
         health_tx.clone(),
-        shutdown_rx.clone(),
-    ));
-
-    let brain_handle = tokio::spawn(brain::run(
-        cfg.clone(),
-        run_ctx.run_id.clone(),
-        markets.clone(),
-        snap_rx.clone(),
-        signal_tx,
-        health_counters.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -223,29 +240,128 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    let shadow_handle = tokio::spawn(shadow::run(
-        cfg.clone(),
-        markets.clone(),
-        trade_rx,
-        signal_rx,
-        shadow_path,
-        health_counters.clone(),
-        shutdown_rx.clone(),
-    ));
+    let (brain_handle, worker_handle) = match mode {
+        Mode::DryRun => {
+            let (signal_tx, signal_rx) = mpsc::channel::<Signal>(10_000);
+
+            let brain_handle = tokio::spawn(brain::run(
+                cfg.clone(),
+                run_ctx.run_id.clone(),
+                markets.clone(),
+                snap_rx.clone(),
+                signal_tx,
+                health_counters.clone(),
+                shutdown_rx.clone(),
+            ));
+
+            let worker_handle = tokio::spawn(shadow::run(
+                cfg.clone(),
+                markets.clone(),
+                trade_rx,
+                signal_rx,
+                shadow_path,
+                health_counters.clone(),
+                shutdown_rx.clone(),
+            ));
+
+            (brain_handle, worker_handle)
+        }
+        Mode::LiveSim => {
+            let (brain_signal_tx, mut brain_signal_rx) = mpsc::channel::<Signal>(10_000);
+            let (shadow_signal_tx, shadow_signal_rx) = mpsc::channel::<Signal>(10_000);
+            let (sniper_signal_tx, sniper_signal_rx) = mpsc::channel::<Signal>(10_000);
+            let (calibration_tx, calibration_rx) = mpsc::channel::<CalibrationEvent>(10_000);
+
+            let brain_handle = tokio::spawn(brain::run(
+                cfg.clone(),
+                run_ctx.run_id.clone(),
+                markets.clone(),
+                snap_rx.clone(),
+                brain_signal_tx,
+                health_counters.clone(),
+                shutdown_rx.clone(),
+            ));
+
+            let mut shutdown = shutdown_rx.clone();
+            let signal_tee_fut = async move {
+                let mut drain_only = false;
+                loop {
+                    tokio::select! {
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                drain_only = true;
+                            }
+                        }
+                        maybe = brain_signal_rx.recv() => {
+                            let Some(sig) = maybe else { break; };
+
+                            if drain_only {
+                                continue;
+                            }
+
+                            if shadow_signal_tx.try_send(sig.clone()).is_err() {
+                                warn!(signal_id = sig.signal_id, "shadow signal channel full/closed; dropped");
+                            }
+                            if sniper_signal_tx.try_send(sig).is_err() {
+                                warn!("sniper signal channel full/closed; dropped signal");
+                            }
+                        }
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+
+            let shadow_fut = shadow::run(
+                cfg.clone(),
+                markets.clone(),
+                trade_rx,
+                shadow_signal_rx,
+                shadow_path,
+                health_counters.clone(),
+                shutdown_rx.clone(),
+            );
+
+            let sniper_fut = sniper::run(
+                cfg.clone(),
+                snap_rx.clone(),
+                sniper_signal_rx,
+                trade_log_path,
+                calibration_tx,
+                shutdown_rx.clone(),
+            );
+
+            let calibration_fut = calibration::run(
+                cfg.clone(),
+                calibration_rx,
+                calibration_log_path,
+                run_ctx.run_dir.clone(),
+                shutdown_rx.clone(),
+            );
+
+            let worker_handle = tokio::spawn(async move {
+                tokio::try_join!(signal_tee_fut, shadow_fut, sniper_fut, calibration_fut)?;
+                Ok::<(), anyhow::Error>(())
+            });
+
+            (brain_handle, worker_handle)
+        }
+    };
 
     let mut ws_handle = Some(ws_handle);
+    let mut snapshots_handle = Some(snapshots_handle);
     let mut trades_handle = Some(trades_handle);
     let mut brain_handle = Some(brain_handle);
-    let mut shadow_handle = Some(shadow_handle);
+    let mut worker_handle = Some(worker_handle);
     let mut health_handle = Some(health_handle);
     let mut health_log_handle = Some(health_log_handle);
 
     enum ExitReason {
         CtrlC,
         Ws,
+        Snapshots,
         Trades,
         Brain,
-        ShadowOrSniper,
+        Worker,
         HealthWriter,
         HealthLog,
     }
@@ -265,6 +381,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             ExitReason::Ws
+        }
+        res = snapshots_handle.as_mut().unwrap() => {
+            snapshots_handle.take();
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() { first_err = Some(add_context(e, "snapshots task failed")); }
+                }
+                Err(e) => {
+                    if first_err.is_none() { first_err = Some(add_context(anyhow!(e), "snapshots task join failed")); }
+                }
+            }
+            ExitReason::Snapshots
         }
         res = trades_handle.as_mut().unwrap() => {
             trades_handle.take();
@@ -292,18 +421,18 @@ async fn main() -> anyhow::Result<()> {
             }
             ExitReason::Brain
         }
-        res = shadow_handle.as_mut().unwrap() => {
-            shadow_handle.take();
+        res = worker_handle.as_mut().unwrap() => {
+            worker_handle.take();
             match res {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    if first_err.is_none() { first_err = Some(add_context(e, "shadow task failed")); }
+                    if first_err.is_none() { first_err = Some(add_context(e, "worker task failed")); }
                 }
                 Err(e) => {
-                    if first_err.is_none() { first_err = Some(add_context(anyhow!(e), "shadow task join failed")); }
+                    if first_err.is_none() { first_err = Some(add_context(anyhow!(e), "worker task join failed")); }
                 }
             }
-            ExitReason::ShadowOrSniper
+            ExitReason::Worker
         }
         res = health_handle.as_mut().unwrap() => {
             health_handle.take();
@@ -342,6 +471,21 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    if let Some(h) = snapshots_handle.take() {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(add_context(e, "snapshots task failed"));
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(add_context(anyhow!(e), "snapshots task join failed"));
+                }
+            }
+        }
+    }
     if let Some(h) = trades_handle.take() {
         match h.await {
             Ok(Ok(())) => {}
@@ -372,17 +516,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    if let Some(h) = shadow_handle.take() {
+    if let Some(h) = worker_handle.take() {
         match h.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 if first_err.is_none() {
-                    first_err = Some(add_context(e, "shadow task failed"));
+                    first_err = Some(add_context(e, "worker task failed"));
                 }
             }
             Err(e) => {
                 if first_err.is_none() {
-                    first_err = Some(add_context(anyhow!(e), "shadow task join failed"));
+                    first_err = Some(add_context(anyhow!(e), "worker task join failed"));
                 }
             }
         }
@@ -405,9 +549,10 @@ async fn main() -> anyhow::Result<()> {
     match exit_reason {
         ExitReason::CtrlC => {}
         ExitReason::Ws => info!("ws task exited"),
+        ExitReason::Snapshots => info!("snapshots task exited"),
         ExitReason::Trades => info!("trades task exited"),
         ExitReason::Brain => info!("brain task exited"),
-        ExitReason::ShadowOrSniper => info!("shadow task exited"),
+        ExitReason::Worker => info!("worker task exited"),
         ExitReason::HealthWriter => info!("health writer task exited"),
         ExitReason::HealthLog => info!("health log task exited"),
     }
@@ -445,12 +590,14 @@ fn add_context(err: anyhow::Error, ctx: &'static str) -> anyhow::Error {
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     DryRun,
+    LiveSim,
 }
 
 impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Mode::DryRun => write!(f, "dry_run"),
+            Mode::LiveSim => write!(f, "live_sim"),
         }
     }
 }
@@ -463,9 +610,7 @@ fn resolve_mode(cli: Option<&str>) -> anyhow::Result<Mode> {
 
     match raw.trim().to_ascii_lowercase().as_str() {
         "dry_run" | "dryrun" => Ok(Mode::DryRun),
-        "live" => Err(anyhow!(
-            "refusing to start: Phase 1 is dry_run only (set RAZOR_MODE=dry_run)"
-        )),
+        "live" | "live_sim" | "livesim" => Ok(Mode::LiveSim),
         other => Err(anyhow!("unknown mode: {other} (expected dry_run)")),
     }
 }
@@ -473,7 +618,11 @@ fn resolve_mode(cli: Option<&str>) -> anyhow::Result<Mode> {
 fn ensure_data_latest_file_links(data_dir: &std::path::Path) -> anyhow::Result<()> {
     ensure_latest_file_symlink(data_dir, schema::FILE_TICKS)?;
     ensure_latest_file_symlink(data_dir, schema::FILE_TRADES)?;
+    ensure_latest_file_symlink(data_dir, schema::FILE_SNAPSHOTS)?;
     ensure_latest_file_symlink(data_dir, schema::FILE_SHADOW_LOG)?;
+    ensure_latest_file_symlink(data_dir, schema::FILE_TRADE_LOG)?;
+    ensure_latest_file_symlink(data_dir, schema::FILE_CALIBRATION_LOG)?;
+    ensure_latest_file_symlink(data_dir, schema::FILE_CALIBRATION_SUGGEST)?;
     ensure_latest_file_symlink(data_dir, schema::FILE_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -508,4 +657,41 @@ fn ensure_latest_file_symlink(data_dir: &std::path::Path, file_name: &str) -> an
     }
 
     Ok(())
+}
+
+fn sim_stress_profile_from_env() -> run_meta::SimStressProfile {
+    run_meta::SimStressProfile {
+        force_chase_fail: env_flag("RAZOR_SIM_FORCE_CHASE_FAIL"),
+        latency_spike_ms: env_u64("RAZOR_SIM_LATENCY_SPIKE_MS").unwrap_or(0),
+        latency_spike_every: env_u64("RAZOR_SIM_LATENCY_SPIKE_EVERY").unwrap_or(0),
+        drop_book_pct: env_f64("RAZOR_SIM_DROP_BOOK_PCT")
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        http_429_every: env_u64("RAZOR_SIM_HTTP_429_EVERY").unwrap_or(0),
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "y"
+        })
+        .unwrap_or(false)
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    let raw = std::env::var(name).ok()?;
+    raw.trim().parse::<u64>().ok()
+}
+
+fn env_f64(name: &str) -> Option<f64> {
+    let raw = std::env::var(name).ok()?;
+    let v = raw.trim().parse::<f64>().ok()?;
+    if v.is_finite() {
+        Some(v)
+    } else {
+        None
+    }
 }

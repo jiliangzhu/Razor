@@ -1,0 +1,3 @@
+ts_ms,market_id,legs_n,leg0_token_id,leg0_best_bid,leg0_best_ask,leg0_depth3_usdc,leg1_token_id,leg1_best_bid,leg1_best_ask,leg1_depth3_usdc,leg2_token_id,leg2_best_bid,leg2_best_ask,leg2_depth3_usdc
+1000,m,2,A,0.4799,0.48,600,B,0.4899,0.49,1000,,0,0,0
+

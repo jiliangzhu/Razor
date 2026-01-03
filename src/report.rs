@@ -31,6 +31,7 @@ pub struct Report {
     pub by_strategy: ByStrategy,
     pub worst_20: Vec<WorstEntry>,
     pub verdict: Verdict,
+    pub stress: Option<crate::shadow_sweep::StressSummary>,
 
     #[serde(skip_serializing)]
     pub rows_total: u64,
@@ -157,6 +158,7 @@ pub fn compute_report(
                     min_avg_set_ratio: thresholds.min_avg_set_ratio,
                 },
             },
+            stress: None,
             rows_total: 0,
             rows_bad: 0,
         });
@@ -288,6 +290,13 @@ pub fn compute_report(
     };
     let (go, reasons) = verdict(total_shadow_pnl, legging_fail_share, thresholds);
 
+    let stress = crate::shadow_sweep::compute_stress_summary(
+        shadow_log_path,
+        run_id,
+        thresholds.min_avg_set_ratio,
+    )
+    .ok();
+
     Ok(Report {
         schema_version: SCHEMA_VERSION.to_string(),
         run_id: run_id.to_string(),
@@ -318,6 +327,7 @@ pub fn compute_report(
                 min_avg_set_ratio: thresholds.min_avg_set_ratio,
             },
         },
+        stress,
         rows_total,
         rows_bad,
     })
@@ -393,6 +403,48 @@ fn render_report_md(report: &Report) -> String {
         "- bad_rows: {} / {}\n\n",
         report.rows_bad, report.rows_total
     ));
+
+    if let Some(stress) = report.stress.as_ref() {
+        out.push_str("## Stress (does NOT change verdict)\n\n");
+        out.push_str("| variant | rows_ok | rows_bad | total_pnl_sum | avg_set_ratio | legging_rate | worst_20_pnl_sum |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+        out.push_str(&format!(
+            "| baseline(recalc) | {} | {} | {:.6} | {:.6} | {:.6} | {:.6} |\n",
+            stress.baseline.rows_ok,
+            stress.baseline.rows_bad,
+            stress.baseline.total_pnl_sum,
+            stress.baseline.set_ratio_avg,
+            stress.baseline.legging_rate,
+            stress.baseline.worst_20_pnl_sum,
+        ));
+        out.push_str(&format!(
+            "| dump=0.10 | {} | {} | {:.6} | {:.6} | {:.6} | {:.6} |\n",
+            stress.dump_0_10.rows_ok,
+            stress.dump_0_10.rows_bad,
+            stress.dump_0_10.total_pnl_sum,
+            stress.dump_0_10.set_ratio_avg,
+            stress.dump_0_10.legging_rate,
+            stress.dump_0_10.worst_20_pnl_sum,
+        ));
+        out.push_str(&format!(
+            "| fill_share*0.70 | {} | {} | {:.6} | {:.6} | {:.6} | {:.6} |\n",
+            stress.fill_share_x0_70.rows_ok,
+            stress.fill_share_x0_70.rows_bad,
+            stress.fill_share_x0_70.total_pnl_sum,
+            stress.fill_share_x0_70.set_ratio_avg,
+            stress.fill_share_x0_70.legging_rate,
+            stress.fill_share_x0_70.worst_20_pnl_sum,
+        ));
+        out.push_str(&format!(
+            "| dump=0.10 & fill*0.70 | {} | {} | {:.6} | {:.6} | {:.6} | {:.6} |\n\n",
+            stress.dump_0_10_fill_share_x0_70.rows_ok,
+            stress.dump_0_10_fill_share_x0_70.rows_bad,
+            stress.dump_0_10_fill_share_x0_70.total_pnl_sum,
+            stress.dump_0_10_fill_share_x0_70.set_ratio_avg,
+            stress.dump_0_10_fill_share_x0_70.legging_rate,
+            stress.dump_0_10_fill_share_x0_70.worst_20_pnl_sum,
+        ));
+    }
 
     out.push_str("## By Bucket\n\n");
     out.push_str("| bucket | signals | pnl | avg_set_ratio |\n");

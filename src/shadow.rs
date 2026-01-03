@@ -59,6 +59,21 @@ pub async fn run(
             }
             maybe = trade_rx.recv() => {
                 let Some(t) = maybe else {
+                    if *shutdown.borrow() {
+                        let now = now_ms();
+                        settle_ready(
+                            &cfg,
+                            &mut out,
+                            &store,
+                            &mut pending,
+                            &mut last_written_signal_id,
+                            now,
+                            window_start_ms,
+                            window_end_ms,
+                            health.as_ref(),
+                        )?;
+                        break;
+                    }
                     return Err(anyhow::anyhow!("trade channel closed"));
                 };
                 let push = store.push(t);
@@ -69,6 +84,21 @@ pub async fn run(
             }
             maybe = signal_rx.recv() => {
                 let Some(s) = maybe else {
+                    if *shutdown.borrow() {
+                        let now = now_ms();
+                        settle_ready(
+                            &cfg,
+                            &mut out,
+                            &store,
+                            &mut pending,
+                            &mut last_written_signal_id,
+                            now,
+                            window_start_ms,
+                            window_end_ms,
+                            health.as_ref(),
+                        )?;
+                        break;
+                    }
                     return Err(anyhow::anyhow!("signal channel closed"));
                 };
                 pending.push(s);
@@ -360,6 +390,19 @@ fn settle_one(
         reasons.push(ShadowNoteReason::WindowDataGap);
     }
 
+    if cfg.shadow.trade_size_suspect_threshold > 0.0
+        && window_stats.max_trade_size.is_finite()
+        && window_stats.max_trade_size >= cfg.shadow.trade_size_suspect_threshold
+    {
+        reasons.push(ShadowNoteReason::TradeSizeSuspect);
+    }
+    if cfg.shadow.trade_notional_suspect_threshold > 0.0
+        && window_stats.max_trade_notional.is_finite()
+        && window_stats.max_trade_notional >= cfg.shadow.trade_notional_suspect_threshold
+    {
+        reasons.push(ShadowNoteReason::TradeSizeSuspect);
+    }
+
     if v_mkt_sum <= 0.0 {
         reasons.push(ShadowNoteReason::NoTrades);
     }
@@ -464,6 +507,8 @@ mod tests {
             run: RunConfig {
                 data_dir: "data".into(),
                 market_ids: vec![],
+                snapshot_log_interval_ms: 1_000,
+                raw_ws_rotate_keep: 0,
             },
             schema_version: crate::schema::SCHEMA_VERSION.to_string(),
             brain: BrainConfig {
@@ -613,6 +658,8 @@ mod tests {
             run: RunConfig {
                 data_dir: "data".into(),
                 market_ids: vec![],
+                snapshot_log_interval_ms: 1_000,
+                raw_ws_rotate_keep: 0,
             },
             schema_version: crate::schema::SCHEMA_VERSION.to_string(),
             brain: BrainConfig {
@@ -734,5 +781,114 @@ mod tests {
         let expected_cost0 = q_left0 * Bps::FEE_POLY.apply_cost(0.49);
         // exit_price=0 => proceeds=0 => pnl_left_total = -cost_left0
         assert_approx_eq!(pnl_left_total, -expected_cost0, 1e-9);
+    }
+
+    #[test]
+    fn trade_size_suspect_reason_is_emitted() {
+        let base_ms = now_ms();
+        let mut cfg = Config {
+            polymarket: PolymarketConfig::default(),
+            run: RunConfig {
+                data_dir: "data".into(),
+                market_ids: vec![],
+                snapshot_log_interval_ms: 1_000,
+                raw_ws_rotate_keep: 0,
+            },
+            schema_version: crate::schema::SCHEMA_VERSION.to_string(),
+            brain: BrainConfig::default(),
+            buckets: BucketConfig {
+                fill_share_liquid_p25: 0.5,
+                fill_share_thin_p25: 0.1,
+            },
+            shadow: ShadowConfig::default(),
+            market_select: MarketSelectConfig::default(),
+            report: ReportConfig::default(),
+            live: LiveConfig::default(),
+            calibration: CalibrationConfig::default(),
+            sim: SimConfig::default(),
+        };
+        cfg.shadow.trade_size_suspect_threshold = 10.0;
+        cfg.shadow.trade_notional_suspect_threshold = 0.0;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "razor_shadow_test_trade_size_suspect_{}.csv",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let mut out = CsvAppender::open(&tmp, &SHADOW_HEADER).expect("open csv");
+
+        let s = Signal {
+            run_id: "run_test".to_string(),
+            signal_id: 1,
+            signal_ts_ms: base_ms,
+            market_id: "mkt".to_string(),
+            strategy: Strategy::Binary,
+            bucket: Bucket::Liquid,
+            reasons: Vec::new(),
+            q_req: 10.0,
+            raw_cost_bps: Bps::from_price_cost(0.97),
+            raw_edge_bps: Bps::new(300),
+            hard_fees_bps: Bps::FEE_POLY + Bps::FEE_MERGE,
+            risk_premium_bps: Bps::new(80),
+            expected_net_bps: Bps::new(10),
+            bucket_metrics: BucketMetrics {
+                worst_leg_index: 0,
+                worst_spread_bps: 0,
+                worst_depth3_usdc: 1000.0,
+                is_depth3_degraded: false,
+            },
+            legs: vec![
+                Leg {
+                    leg_index: 0,
+                    token_id: "A".to_string(),
+                    side: Side::Buy,
+                    limit_price: 0.49,
+                    qty: 10.0,
+                    best_bid_at_signal: 0.48,
+                    best_ask_at_signal: 0.49,
+                },
+                Leg {
+                    leg_index: 1,
+                    token_id: "B".to_string(),
+                    side: Side::Buy,
+                    limit_price: 0.48,
+                    qty: 10.0,
+                    best_bid_at_signal: 0.47,
+                    best_ask_at_signal: 0.48,
+                },
+            ],
+        };
+
+        let mut store = TradeStore::new_with_cap(60_000, usize::MAX);
+        let _ = store.push(TradeTick {
+            ts_ms: base_ms + 200,
+            ingest_ts_ms: base_ms + 200,
+            exchange_ts_ms: Some(base_ms + 200),
+            market_id: "mkt".to_string(),
+            token_id: "A".to_string(),
+            price: 0.48,
+            size: 30.0,
+            trade_id: "t1".to_string(),
+        });
+
+        settle_one(&cfg, &mut out, &store, &s, 100, 1_100).expect("settle");
+        out.flush_and_sync().expect("flush");
+
+        let text = std::fs::read_to_string(&tmp).expect("read csv");
+        let mut lines = text.lines();
+        let header = lines.next().expect("header");
+        let row = lines.next().expect("row");
+        let names: Vec<&str> = header.split(',').collect();
+        let cols: Vec<&str> = row.split(',').collect();
+
+        let idx = |name: &str| -> usize {
+            names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("missing column {name}"))
+        };
+
+        let notes = cols[idx("notes")];
+        assert_eq!(notes, "TRADE_SIZE_SUSPECT");
     }
 }

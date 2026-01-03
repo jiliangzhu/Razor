@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -9,9 +10,12 @@ use tracing::{info, warn};
 
 use crate::buckets::classify_bucket;
 use crate::config::Config;
+use crate::json_util::parse_f64;
 use crate::market_select::gamma::GammaMarket;
 use crate::market_select::metrics::{self, MarketScoreRowComputed, SnapshotAccum, TradesAccum};
 use crate::types::{now_ms, now_us, LegSnapshot, MarketSnapshot};
+
+static SIM_HTTP_429_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 struct LegState {
@@ -86,8 +90,9 @@ pub async fn probe_market(
         cfg.shadow.trade_poll_interval_ms.max(200),
     ));
     trade_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Snapshot sample tick: fixed 1 Hz so samples_total stays bounded and comparable.
-    let mut sample_tick = tokio::time::interval(Duration::from_secs(1));
+    // Snapshot sample tick: fixed interval so samples_total stays bounded and comparable.
+    let mut sample_tick =
+        tokio::time::interval(Duration::from_millis(metrics::SNAPSHOT_SAMPLE_INTERVAL_MS));
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     while now_ms() < probe_end_ms {
@@ -337,6 +342,21 @@ async fn poll_trades(
     trades_acc: &mut TradesAccum,
     trade_dedup: &mut HashSet<String>,
 ) {
+    if let Some(every) = env_u64("RAZOR_SIM_HTTP_429_EVERY") {
+        if every > 0 {
+            let seq = SIM_HTTP_429_SEQ
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if seq % every == 0 {
+                warn!(
+                    condition_id,
+                    seq, every, "SIM injected HTTP 429 (skipping this poll)"
+                );
+                return;
+            }
+        }
+    }
+
     let resp = match client
         .get(url)
         .query(&[
@@ -408,11 +428,18 @@ async fn poll_trades(
     }
 }
 
+fn env_u64(name: &str) -> Option<u64> {
+    let raw = std::env::var(name).ok()?;
+    raw.trim().parse::<u64>().ok()
+}
+
 fn normalize_ts_ms(ts: u64) -> u64 {
-    if ts < 1_000_000_000_000 {
-        ts.saturating_mul(1000)
-    } else {
-        ts
+    // Normalize unix timestamps to milliseconds (see `feed::normalize_ts_ms`).
+    match ts {
+        0..=99_999_999_999 => ts.saturating_mul(1_000),
+        100_000_000_000..=99_999_999_999_999 => ts,
+        100_000_000_000_000..=99_999_999_999_999_999 => ts / 1_000,
+        _ => ts / 1_000_000,
     }
 }
 
@@ -528,14 +555,6 @@ fn handle_ws_price_change(
     Ok(())
 }
 
-fn parse_f64(v: Option<&serde_json::Value>) -> Option<f64> {
-    let v = v?;
-    if let Some(s) = v.as_str() {
-        return s.parse::<f64>().ok();
-    }
-    v.as_f64()
-}
-
 #[derive(Clone, Copy)]
 enum PriceSide {
     Bid,
@@ -632,5 +651,18 @@ mod tests {
         ];
         let d = ask_depth3_usdc(&asks);
         assert_approx_eq!(d, 32.0);
+    }
+
+    #[test]
+    fn http_429_every_k_logic_is_stable() {
+        fn fires(seq: u64, every: u64) -> bool {
+            every > 0 && seq % every == 0
+        }
+        assert!(!fires(1, 3));
+        assert!(!fires(2, 3));
+        assert!(fires(3, 3));
+        assert!(!fires(4, 3));
+        assert!(!fires(5, 3));
+        assert!(fires(6, 3));
     }
 }

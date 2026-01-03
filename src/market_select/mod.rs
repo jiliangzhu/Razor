@@ -56,22 +56,28 @@ pub struct MarketSelectOptions {
 }
 
 pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> {
-    let run_id = format_run_id(now_ms());
+    let started_at_ms = now_ms();
+    let run_id = format_run_id(started_at_ms);
     let out_dir = opts
         .out_dir
         .clone()
         .unwrap_or_else(|| default_out_dir(&cfg.run.data_dir, &run_id));
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
 
-    // Crash-tolerant progress output: append completed probe rows as they arrive.
-    // The final `market_scores.csv` remains deterministically sorted at the end.
-    let mut partial = match CsvAppender::open(
-        out_dir.join("market_scores.partial.csv"),
+    info!(run_id, out_dir = %out_dir.display(), "market_select run initialized");
+
+    // Crash/ctrl-c tolerant output: append completed probe rows as they arrive into market_scores.csv.
+    // At the end (normal exit), we rewrite market_scores.csv into a deterministic sorted order.
+    let mut market_scores_live = match CsvAppender::open(
+        out_dir.join(output::FILE_MARKET_SCORES),
         &output::MARKET_SCORES_HEADER,
     ) {
         Ok(v) => Some(v),
         Err(e) => {
-            warn!(error = %e, "open market_scores.partial.csv failed; continuing without partial output");
+            warn!(
+                error = %e,
+                "open market_scores.csv failed; continuing without incremental output"
+            );
             None
         }
     };
@@ -106,10 +112,14 @@ pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> 
     let mut rows: Vec<MarketScoreRowComputed> = Vec::new();
     let mut probes_completed_ok: usize = 0;
     let mut probes_completed_failed: usize = 0;
+    let mut last_ok_gamma_id: Option<String> = None;
     let mut aborted = false;
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+
+    let mut last_progress_write_ms = started_at_ms;
+    let progress_write_every_ms: u64 = 2_000;
 
     loop {
         tokio::select! {
@@ -133,9 +143,10 @@ pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> 
                 match next {
                     Ok((_m, Ok(r))) => {
                         probes_completed_ok += 1;
-                        if let Some(out) = partial.as_mut() {
+                        last_ok_gamma_id = Some(r.row.gamma_id.clone());
+                        if let Some(out) = market_scores_live.as_mut() {
                             if let Err(e) = out.write_record(output::row_to_record(&r.row)) {
-                                warn!(error = %e, "write market_scores.partial.csv row failed");
+                                warn!(error = %e, "write market_scores.csv row failed");
                             }
                         }
                         rows.push(r);
@@ -152,20 +163,54 @@ pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> 
                         warn!(error = %e, "probe task join error");
                     }
                 }
+
+                let now_ms = now_ms();
+                if now_ms.saturating_sub(last_progress_write_ms) >= progress_write_every_ms {
+                    last_progress_write_ms = now_ms;
+                    if let Err(e) = output::write_recommendation_json(
+                        &out_dir,
+                        &run_id,
+                        opts.probe_seconds,
+                        candidates_total,
+                        probes_completed_ok,
+                        probes_completed_failed,
+                        aborted,
+                        started_at_ms,
+                        now_ms,
+                        last_ok_gamma_id.as_deref(),
+                        None,
+                        None,
+                    ) {
+                        warn!(error = %e, "write progress recommendation.json failed");
+                    }
+                }
             }
         }
     }
 
     if aborted {
-        // Drain aborted tasks to avoid running probes in the background after we start writing outputs.
-        while let Some(_res) = join_set.join_next().await {}
-    }
-
-    if let Some(out) = partial.as_mut() {
-        if let Err(e) = out.flush_and_sync() {
-            warn!(error = %e, "flush market_scores.partial.csv failed");
+        // Best-effort drain, but do not block output forever (users often Ctrl-C and expect outputs).
+        let drain_timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+        tokio::pin!(drain_timeout);
+        loop {
+            tokio::select! {
+                _ = &mut drain_timeout => {
+                    warn!("timeout draining aborted probe tasks; writing outputs anyway");
+                    break;
+                }
+                next = join_set.join_next() => {
+                    if next.is_none() { break; }
+                }
+            }
         }
     }
+
+    if let Some(out) = market_scores_live.as_mut() {
+        if let Err(e) = out.flush_and_sync() {
+            warn!(error = %e, "flush market_scores.csv failed");
+        }
+    }
+    drop(market_scores_live);
 
     // Deterministic ordering for output: by gamma_volume24hr desc then gamma_id asc.
     rows.sort_by(|a, b| {
@@ -181,7 +226,14 @@ pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> 
             Err(e) => (None, Some(e)),
         };
 
-    output::write_suggest_toml(&out_dir, selected_opt.as_ref()).context("write suggest.toml")?;
+    let selection_error_string = selection_error.as_ref().map(|e| e.to_string());
+
+    output::write_suggest_toml(
+        &out_dir,
+        selected_opt.as_ref(),
+        selection_error_string.as_deref(),
+    )
+    .context("write suggest.toml")?;
     output::write_recommendation_json(
         &out_dir,
         &run_id,
@@ -190,8 +242,11 @@ pub async fn run(cfg: &Config, opts: MarketSelectOptions) -> anyhow::Result<()> 
         probes_completed_ok,
         probes_completed_failed,
         aborted,
+        started_at_ms,
+        now_ms(),
+        last_ok_gamma_id.as_deref(),
         selected_opt.as_ref(),
-        selection_error.as_ref().map(|e| e.to_string()),
+        selection_error_string.clone(),
     )
     .context("write recommendation.json")?;
 

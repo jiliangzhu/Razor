@@ -21,6 +21,10 @@ fn tmp_csv(name: &str, contents: &str) -> PathBuf {
 fn reason_code_display_is_strict() {
     assert_eq!(ShadowNoteReason::NoTrades.to_string(), "NO_TRADES");
     assert_eq!(ShadowNoteReason::WindowEmpty.to_string(), "WINDOW_EMPTY");
+    assert_eq!(
+        ShadowNoteReason::TradeSizeSuspect.to_string(),
+        "TRADE_SIZE_SUSPECT"
+    );
     assert_eq!(ShadowNoteReason::DedupHit.to_string(), "DEDUP_HIT");
     assert_eq!(
         ShadowNoteReason::BucketThinNan.to_string(),

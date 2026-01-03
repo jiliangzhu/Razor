@@ -16,8 +16,13 @@
   - `shadow_log.csv`
   - `ticks.csv`
 
-**Day 14 判决只看数据：**
-- `TotalShadowPnL > 0` 且 `SetRatio >= 0.85` => **GO**
+**Day 14 判决只看数据（冻结，必须机械可复现）：**
+- `TotalShadowPnL = Σ total_pnl`（按 `shadow_log.csv` 的 `total_pnl` 求和）
+- `set_ratio_ok_threshold = 0.85`
+- `legging_fail_share = share(set_ratio < set_ratio_ok_threshold)`（只统计有效行）
+- **GO 当且仅当**：
+  - `TotalShadowPnL > 0`
+  - 且 `legging_fail_share <= 0.15`
 - 否则 => **NO GO**（项目结束）
 
 ### Phase 2（Day 15–30）：校准者 / 小额实盘

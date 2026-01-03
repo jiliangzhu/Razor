@@ -8,6 +8,7 @@ pub const SCHEMA_VERSION: &str = "1.3.2a";
 
 pub const FILE_TICKS: &str = "ticks.csv";
 pub const FILE_TRADES: &str = "trades.csv";
+pub const FILE_SNAPSHOTS: &str = "snapshots.csv";
 pub const FILE_SHADOW_LOG: &str = "shadow_log.csv";
 pub const FILE_REPORT_JSON: &str = "report.json";
 pub const FILE_REPORT_MD: &str = "report.md";
@@ -32,6 +33,24 @@ pub const TRADES_HEADER: [&str; 8] = [
     "trade_id",
     "ingest_ts_ms",
     "exchange_ts_ms",
+];
+
+pub const SNAPSHOTS_HEADER: [&str; 15] = [
+    "ts_ms",
+    "market_id",
+    "legs_n",
+    "leg0_token_id",
+    "leg0_best_bid",
+    "leg0_best_ask",
+    "leg0_depth3_usdc",
+    "leg1_token_id",
+    "leg1_best_bid",
+    "leg1_best_ask",
+    "leg1_depth3_usdc",
+    "leg2_token_id",
+    "leg2_best_bid",
+    "leg2_best_ask",
+    "leg2_depth3_usdc",
 ];
 
 pub const SHADOW_HEADER: [&str; 38] = [
@@ -131,6 +150,7 @@ pub fn write_schema_version_json(
     files.insert(FILE_RAW_WS_JSONL.to_string(), "v1".to_string());
     files.insert(FILE_TICKS.to_string(), "v1".to_string());
     files.insert(FILE_TRADES.to_string(), "v3".to_string());
+    files.insert(FILE_SNAPSHOTS.to_string(), "v1".to_string());
     files.insert(FILE_SHADOW_LOG.to_string(), "v5".to_string());
     files.insert(FILE_REPORT_JSON.to_string(), "v1".to_string());
     files.insert(FILE_REPORT_MD.to_string(), "v1".to_string());

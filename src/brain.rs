@@ -337,6 +337,8 @@ mod tests {
             run: RunConfig {
                 data_dir: "data".into(),
                 market_ids: vec![],
+                snapshot_log_interval_ms: 1_000,
+                raw_ws_rotate_keep: 0,
             },
             schema_version: crate::schema::SCHEMA_VERSION.to_string(),
             brain: BrainConfig {
@@ -436,6 +438,8 @@ mod tests {
             run: RunConfig {
                 data_dir: "data".into(),
                 market_ids: vec![],
+                snapshot_log_interval_ms: 1_000,
+                raw_ws_rotate_keep: 0,
             },
             schema_version: crate::schema::SCHEMA_VERSION.to_string(),
             brain: BrainConfig {

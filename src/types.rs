@@ -305,6 +305,8 @@ pub struct FillReport {
     pub filled_qty: f64,
     pub avg_price: f64,
     pub status: FillStatus,
+    pub order_id: String,
+    pub latency_ms: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

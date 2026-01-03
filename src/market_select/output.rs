@@ -3,7 +3,9 @@ use std::path::Path;
 use anyhow::Context as _;
 use serde::Serialize;
 
-use crate::market_select::metrics::{MarketScoreRow, MarketScoreRowComputed, BUCKET_AFTER_DEGRADE};
+use crate::market_select::metrics::{
+    MarketScoreRow, MarketScoreRowComputed, BUCKET_AFTER_DEGRADE, SNAPSHOT_SAMPLE_INTERVAL_MS,
+};
 use crate::market_select::select::SelectedTwoMarkets;
 
 pub const FILE_MARKET_SCORES: &str = "market_scores.csv";
@@ -68,6 +70,7 @@ pub fn write_market_scores_csv(
 pub fn write_suggest_toml(
     out_dir: &Path,
     selected: Option<&SelectedTwoMarkets>,
+    selection_error: Option<&str>,
 ) -> anyhow::Result<()> {
     let path = out_dir.join(FILE_SUGGEST_TOML);
     let content = match selected {
@@ -75,7 +78,16 @@ pub fn write_suggest_toml(
             "[run]\nmarket_ids = [\"{}\", \"{}\"]\n",
             selected.liquid.row.gamma_id, selected.thin.row.gamma_id
         ),
-        None => "[run]\nmarket_ids = []\n".to_string(),
+        None => {
+            let mut s =
+                "[run]\nmarket_ids = []\n\n[market_select]\ninsufficient_data = true\n".to_string();
+            if let Some(err) = selection_error {
+                // Keep this as a single-line TOML string for copy/paste into PR notes.
+                let escaped = err.replace('\\', "\\\\").replace('"', "\\\"");
+                s.push_str(&format!("reason = \"{escaped}\"\n"));
+            }
+            s
+        }
     };
     std::fs::write(&path, content.as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
@@ -91,6 +103,9 @@ pub fn write_recommendation_json(
     probes_completed_ok: usize,
     probes_completed_failed: usize,
     aborted: bool,
+    started_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+    last_ok_gamma_id: Option<&str>,
     selected: Option<&SelectedTwoMarkets>,
     selection_error: Option<String>,
 ) -> anyhow::Result<()> {
@@ -175,11 +190,21 @@ pub fn write_recommendation_json(
     let out = RecommendationOut {
         run_id: run_id.to_string(),
         probe_seconds,
+        snapshot_sample_interval_ms: SNAPSHOT_SAMPLE_INTERVAL_MS,
         aborted,
         candidates_total,
         probes_completed_ok,
         probes_completed_failed,
         selection_error,
+        progress: ProgressOut {
+            started_at_unix_ms,
+            updated_at_unix_ms,
+            elapsed_seconds: updated_at_unix_ms.saturating_sub(started_at_unix_ms) / 1_000,
+            markets_total: candidates_total,
+            markets_done: probes_completed_ok.saturating_add(probes_completed_failed),
+            markets_failed: probes_completed_failed,
+            last_ok_gamma_id: last_ok_gamma_id.map(|s| s.to_string()),
+        },
         bucket_after_degrade: BUCKET_AFTER_DEGRADE.to_string(),
 
         // Include the required fields as top-level maps for quick eyeballing.
@@ -249,11 +274,13 @@ fn fmt_f64(v: f64) -> String {
 struct RecommendationOut {
     pub run_id: String,
     pub probe_seconds: u64,
+    pub snapshot_sample_interval_ms: u64,
     pub aborted: bool,
     pub candidates_total: usize,
     pub probes_completed_ok: usize,
     pub probes_completed_failed: usize,
     pub selection_error: Option<String>,
+    pub progress: ProgressOut,
     pub probe_hour_of_day_utc: Option<Map2u32>,
     pub probe_market_phase: Option<Map2>,
 
@@ -269,6 +296,17 @@ struct RecommendationOut {
     pub probe_warnings: Option<Map2vec>,
 
     pub selected: Option<SelectedOut>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProgressOut {
+    pub started_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+    pub elapsed_seconds: u64,
+    pub markets_total: usize,
+    pub markets_done: usize,
+    pub markets_failed: usize,
+    pub last_ok_gamma_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -413,5 +451,24 @@ mod tests {
     fn market_scores_header_is_frozen() {
         let header = MARKET_SCORES_HEADER.join(",");
         assert_eq!(header, "run_id,probe_start_unix_ms,probe_end_unix_ms,probe_seconds,gamma_id,condition_id,legs_n,strategy,token0_id,token1_id,token2_id,gamma_volume24hr,gamma_liquidity,snapshots_total,one_sided_book_rate,bucket_nan_rate,depth3_degraded_rate,liquid_bucket_rate,thin_bucket_rate,worst_spread_bps_p50,worst_depth3_usdc_p50,trades_total,trades_per_min,trade_poll_hit_limit_count,trades_duplicated_count,snapshots_eval_total,passes_min_net_edge_count,passes_min_net_edge_per_hour,expected_net_bps_p50,expected_net_bps_p90,expected_net_bps_max");
+    }
+
+    #[test]
+    fn suggest_toml_marks_insufficient_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "razor_market_select_test_{}_{}",
+            std::process::id(),
+            crate::types::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        write_suggest_toml(&dir, None, Some("no markets pass hard gates"))
+            .expect("write suggest.toml");
+
+        let content = std::fs::read_to_string(dir.join(FILE_SUGGEST_TOML)).expect("read suggest");
+        assert!(content.contains("insufficient_data = true"));
+        assert!(content.contains("no markets pass hard gates"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

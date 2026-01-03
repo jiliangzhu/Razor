@@ -52,6 +52,7 @@ fn main() -> anyhow::Result<()> {
     print_run_meta_section(&args.data_dir, &run_id)?;
     let analysis = analyze_shadow_log(&shadow_path, &run_id)?;
     print_overall_section(&analysis, args.starting_capital);
+    print_stress_section(&shadow_path, &run_id);
     print_reason_section(&analysis);
     print_group_section("By Notes (reasons)", "notes", &analysis.by_notes);
     print_group_section("By Strategy", "strategy", &analysis.by_strategy);
@@ -202,11 +203,14 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
     let mut tail: Vec<TailRow> = Vec::new();
 
     for record in rdr.records() {
+        rows_total += 1;
         let record = match record {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => {
+                rows_bad += 1;
+                continue;
+            }
         };
-        rows_total += 1;
 
         if record.get(idx_run_id).unwrap_or("").trim() != run_id {
             rows_other_run += 1;
@@ -513,6 +517,35 @@ fn print_overall_section(a: &ShadowAnalysis, starting_capital: Option<f64>) {
         println!("pnl_pct={pct:.6}");
     }
     println!();
+}
+
+fn print_stress_section(shadow_path: &Path, run_id: &str) {
+    println!("== Stress Summary (does NOT change verdict) ==");
+    match razor::shadow_sweep::compute_stress_summary(shadow_path, run_id, SET_RATIO_OK_THRESHOLD) {
+        Ok(s) => {
+            print_stress_row("baseline(recalc)", &s.baseline);
+            print_stress_row("dump=0.10", &s.dump_0_10);
+            print_stress_row("fill_share*0.70", &s.fill_share_x0_70);
+            print_stress_row("dump=0.10 & fill*0.70", &s.dump_0_10_fill_share_x0_70);
+        }
+        Err(e) => {
+            println!("stress_unavailable={e}");
+        }
+    }
+    println!();
+}
+
+fn print_stress_row(name: &str, m: &razor::shadow_sweep::StressMetrics) {
+    println!(
+        "{:<22} rows_ok={} rows_bad={} total_pnl_sum={:.6} avg_set_ratio={:.6} legging_rate={:.6} worst_20_pnl_sum={:.6}",
+        name,
+        m.rows_ok,
+        m.rows_bad,
+        m.total_pnl_sum,
+        m.set_ratio_avg,
+        m.legging_rate,
+        m.worst_20_pnl_sum
+    );
 }
 
 fn print_reason_section(a: &ShadowAnalysis) {

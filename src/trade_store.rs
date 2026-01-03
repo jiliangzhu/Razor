@@ -17,11 +17,12 @@ pub struct TradeStore {
     last_out_of_order_warn_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct WindowStats {
     pub trades_in_window: usize,
-    #[allow(dead_code)]
     pub max_gap_ms: u64,
+    pub max_trade_size: f64,
+    pub max_trade_notional: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -157,8 +158,9 @@ impl TradeStore {
         }
 
         let mut trades_in_window: usize = 0;
-        let mut max_gap_ms: u64 = 0;
-        let mut prev_ts: Option<u64> = None;
+        let mut ts_samples: Vec<u64> = Vec::new();
+        let mut max_trade_size: f64 = 0.0;
+        let mut max_trade_notional: f64 = 0.0;
 
         for t in self.trades.iter() {
             if t.market_id != market_id {
@@ -169,19 +171,36 @@ impl TradeStore {
                 continue;
             }
             trades_in_window += 1;
-            if let Some(prev) = prev_ts {
-                max_gap_ms = max_gap_ms.max(ts.saturating_sub(prev));
+            ts_samples.push(ts);
+
+            if t.size.is_finite() && t.size > max_trade_size {
+                max_trade_size = t.size;
             }
-            prev_ts = Some(ts);
+            let notional = t.price * t.size;
+            if notional.is_finite() && notional > max_trade_notional {
+                max_trade_notional = notional;
+            }
         }
 
         if trades_in_window == 0 {
             return WindowStats::default();
         }
 
+        // Compute max gap in **timestamp order**, not insertion order, to avoid
+        // under-estimating gaps when trades arrive out-of-order.
+        let mut max_gap_ms: u64 = 0;
+        ts_samples.sort_unstable();
+        for pair in ts_samples.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            max_gap_ms = max_gap_ms.max(b.saturating_sub(a));
+        }
+
         WindowStats {
             trades_in_window,
             max_gap_ms,
+            max_trade_size,
+            max_trade_notional,
         }
     }
 
@@ -437,5 +456,48 @@ mod tests {
 
         let v = store.volume_at_or_better_price("m", "A", base, base + 100, 0.50);
         assert_eq!(v, 3.0);
+    }
+
+    #[test]
+    fn window_stats_gap_is_computed_in_timestamp_order() {
+        let base = now_ms();
+        let mut store = TradeStore::new_with_cap(60_000, usize::MAX);
+
+        // Insert out-of-order ingest timestamps.
+        let _ = store.push(TradeTick {
+            ts_ms: base + 4_000,
+            ingest_ts_ms: base + 4_000,
+            exchange_ts_ms: Some(base + 4_000),
+            market_id: "m".to_string(),
+            token_id: "A".to_string(),
+            price: 0.5,
+            size: 1.0,
+            trade_id: "t1".to_string(),
+        });
+        let _ = store.push(TradeTick {
+            ts_ms: base + 1_000,
+            ingest_ts_ms: base + 1_000,
+            exchange_ts_ms: Some(base + 1_000),
+            market_id: "m".to_string(),
+            token_id: "A".to_string(),
+            price: 0.5,
+            size: 1.0,
+            trade_id: "t2".to_string(),
+        });
+        let _ = store.push(TradeTick {
+            ts_ms: base + 2_000,
+            ingest_ts_ms: base + 2_000,
+            exchange_ts_ms: Some(base + 2_000),
+            market_id: "m".to_string(),
+            token_id: "A".to_string(),
+            price: 0.5,
+            size: 1.0,
+            trade_id: "t3".to_string(),
+        });
+
+        let stats = store.window_stats("m", base, base + 5_000);
+        assert_eq!(stats.trades_in_window, 3);
+        // Sorted ts: +1000, +2000, +4000 -> max gap = 2000.
+        assert_eq!(stats.max_gap_ms, 2_000);
     }
 }

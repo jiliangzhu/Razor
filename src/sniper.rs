@@ -8,9 +8,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::calibration::CalibrationEvent;
 use crate::config::Config;
+use crate::execution::{top_of_book, ExecKind, ExecutionGateway, PlaceIocRequest, TopOfBook};
 use crate::recorder::CsvAppender;
 use crate::schema::TRADE_LOG_HEADER;
-use crate::types::{now_ms, Bps, Bucket, FillReport, FillStatus, MarketSnapshot, Side, Signal};
+use crate::types::{now_ms, Bps, FillReport, FillStatus, MarketSnapshot, Side, Signal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OmsAction {
@@ -19,6 +20,7 @@ enum OmsAction {
     Flatten,
     HardStop,
     Cooldown,
+    DedupHit,
 }
 
 impl OmsAction {
@@ -29,6 +31,16 @@ impl OmsAction {
             OmsAction::Flatten => "FLATTEN",
             OmsAction::HardStop => "HARDSTOP",
             OmsAction::Cooldown => "COOLDOWN",
+            OmsAction::DedupHit => "DEDUP_HIT",
+        }
+    }
+
+    fn exec_kind(self) -> Option<ExecKind> {
+        match self {
+            OmsAction::FireLeg1 => Some(ExecKind::FireLeg1),
+            OmsAction::Chase => Some(ExecKind::Chase),
+            OmsAction::Flatten => Some(ExecKind::Flatten),
+            OmsAction::HardStop | OmsAction::Cooldown | OmsAction::DedupHit => None,
         }
     }
 }
@@ -36,7 +48,6 @@ impl OmsAction {
 #[derive(Debug)]
 enum OmsState {
     Idle,
-    Cooldown { until_ms: u64 },
     HardStop { reason: String },
 }
 
@@ -46,39 +57,30 @@ struct PositionChunk {
     qty: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TopOfBook {
-    best_ask: f64,
-    best_ask_size_best: f64,
-    best_bid: f64,
-    best_bid_size_best: f64,
-}
-
 pub async fn run(
     cfg: Config,
     mut snap_rx: watch::Receiver<Option<MarketSnapshot>>,
-    mut trade_rx: mpsc::Receiver<crate::types::TradeTick>,
     mut signal_rx: mpsc::Receiver<Signal>,
     trade_log_path: PathBuf,
     calibration_tx: mpsc::Sender<CalibrationEvent>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    if cfg.live.enabled {
-        anyhow::bail!("live.enabled=true is forbidden in PR-B (SIM only)");
-    }
-
     let mut trade_log = CsvAppender::open(trade_log_path, &TRADE_LOG_HEADER)?;
 
     let snapshots: Arc<Mutex<HashMap<String, MarketSnapshot>>> =
         Arc::new(Mutex::new(HashMap::new()));
     spawn_snapshot_ingest(&mut snap_rx, Arc::clone(&snapshots));
 
-    // Drain trades so the poller doesn't stall in live(sim).
-    tokio::spawn(async move { while trade_rx.recv().await.is_some() {} });
-
     let force_chase_fail = env_flag("RAZOR_SIM_FORCE_CHASE_FAIL");
     if force_chase_fail {
         warn!("RAZOR_SIM_FORCE_CHASE_FAIL=1 enabled: all CHASE orders will fill NONE");
     }
+    let exec = if cfg.live.enabled {
+        info!("LIVE mode enabled: deriving API creds (orders not implemented yet)");
+        ExecutionGateway::new_live(&cfg).await?
+    } else {
+        ExecutionGateway::new_sim(&cfg, force_chase_fail)
+    };
 
     info!(
         enabled = cfg.live.enabled,
@@ -89,17 +91,19 @@ pub async fn run(
     );
 
     let mut state = OmsState::Idle;
-    let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut hardstop_heartbeat = tokio::time::interval(Duration::from_secs(5));
+    hardstop_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut cooldown_by_market: HashMap<String, u64> = HashMap::new();
+    let mut seen_signal_ids: HashMap<u64, u64> = HashMap::new();
+    let mut last_prune_ms: u64 = 0;
+    const PRUNE_EVERY_MS: u64 = 60_000;
+    const TTL_MS: u64 = 60 * 60_000;
 
     loop {
         tokio::select! {
-            _ = tick.tick() => {
-                if let OmsState::Cooldown{ until_ms } = &state {
-                    if now_ms() >= *until_ms {
-                        state = OmsState::Idle;
-                    }
-                }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
             }
             _ = hardstop_heartbeat.tick() => {
                 if let OmsState::HardStop{ reason } = &state {
@@ -107,35 +111,57 @@ pub async fn run(
                 }
             }
             maybe = signal_rx.recv() => {
-                let Some(signal) = maybe else {
-                    return Err(anyhow::anyhow!("signal channel closed"));
-                };
+                let Some(signal) = maybe else { break; };
+
+                if *shutdown.borrow() {
+                    break;
+                }
+
+                let now = now_ms();
 
                 match &state {
                     OmsState::HardStop{ reason } => {
                         warn!(signal_id = signal.signal_id, %reason, "hardstop; ignoring signal");
                         continue;
                     }
-                    OmsState::Cooldown{ until_ms } => {
-                        let now = now_ms();
-                        if now < *until_ms {
-                            write_trade_row(
-                                &mut trade_log,
-                                &signal,
-                                OmsAction::Cooldown,
-                                -1,
-                                "",
-                                Side::Buy,
-                                0.0,
-                                0.0,
-                                0.0,
-                                FillStatus::None,
-                                "cooldown",
-                            )?;
-                            continue;
-                        }
-                    }
                     OmsState::Idle => {}
+                }
+
+                if let Some(until_ms) = cooldown_by_market.get(&signal.market_id).copied() {
+                    if now < until_ms {
+                        write_trade_row(
+                            &mut trade_log,
+                            &signal,
+                            OmsAction::Cooldown,
+                            -1,
+                            "",
+                            Side::Buy,
+                            0.0,
+                            0.0,
+                            0.0,
+                            FillStatus::None,
+                            &format!("cooldown_until_ms={until_ms}"),
+                        )?;
+                        continue;
+                    }
+                    cooldown_by_market.remove(&signal.market_id);
+                }
+
+                if let Some(prev_ts_ms) = seen_signal_ids.get(&signal.signal_id).copied() {
+                    write_trade_row(
+                        &mut trade_log,
+                        &signal,
+                        OmsAction::DedupHit,
+                        -1,
+                        "",
+                        Side::Buy,
+                        0.0,
+                        0.0,
+                        0.0,
+                        FillStatus::None,
+                        &format!("dedup_prev_ts_ms={prev_ts_ms}"),
+                    )?;
+                    continue;
                 }
 
                 let outcome = process_signal_sim(
@@ -144,8 +170,15 @@ pub async fn run(
                     &snapshots,
                     &mut trade_log,
                     &calibration_tx,
-                    force_chase_fail,
+                    &exec,
                 ).await;
+
+                seen_signal_ids.insert(signal.signal_id, now);
+                if now.saturating_sub(last_prune_ms) >= PRUNE_EVERY_MS {
+                    last_prune_ms = now;
+                    let cutoff = now.saturating_sub(TTL_MS);
+                    seen_signal_ids.retain(|_, ts| *ts >= cutoff);
+                }
 
                 match outcome {
                     SignalOutcome::Completed => {
@@ -163,7 +196,7 @@ pub async fn run(
                             FillStatus::None,
                             &format!("until_ms={until_ms}"),
                         )?;
-                        state = OmsState::Cooldown{ until_ms };
+                        cooldown_by_market.insert(signal.market_id.clone(), until_ms);
                     }
                     SignalOutcome::HardStop { reason } => {
                         write_trade_row(
@@ -186,6 +219,9 @@ pub async fn run(
             }
         }
     }
+
+    trade_log.flush_and_sync()?;
+    Ok(())
 }
 
 enum SignalOutcome {
@@ -199,7 +235,7 @@ async fn process_signal_sim(
     snapshots: &Arc<Mutex<HashMap<String, MarketSnapshot>>>,
     trade_log: &mut CsvAppender,
     calibration_tx: &mpsc::Sender<CalibrationEvent>,
-    force_chase_fail: bool,
+    exec: &ExecutionGateway,
 ) -> SignalOutcome {
     info!(
         signal_id = signal.signal_id,
@@ -228,18 +264,30 @@ async fn process_signal_sim(
         return SignalOutcome::Completed;
     };
 
-    let mut leg_idxs: Vec<usize> = (0..signal.legs.len()).collect();
-    leg_idxs.sort_by(|&a, &b| {
-        let da = depth3_for_token(&snap, &signal.legs[a].token_id);
-        let db = depth3_for_token(&snap, &signal.legs[b].token_id);
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let Some(&leg1_idx) = leg_idxs.first() else {
+    if signal.legs.is_empty() {
         return SignalOutcome::Completed;
+    }
+
+    let mut leg_idxs: Vec<usize> = (0..signal.legs.len()).collect();
+
+    // Prefer the worst-leg anchor computed by Brain (auditable and deterministic).
+    // Fallback to live snapshot depth3 ordering if the index is out of range.
+    let leg1_idx = if signal.bucket_metrics.worst_leg_index < signal.legs.len() {
+        let worst = signal.bucket_metrics.worst_leg_index;
+        leg_idxs.retain(|&i| i != worst);
+        leg_idxs.sort_unstable();
+        leg_idxs.insert(0, worst);
+        worst
+    } else {
+        leg_idxs.sort_by(|&a, &b| {
+            let da = depth3_for_token(&snap, &signal.legs[a].token_id);
+            let db = depth3_for_token(&snap, &signal.legs[b].token_id);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        *leg_idxs.first().unwrap_or(&0)
     };
 
-    let Some(top1) = top_for_token(&snap, &signal.legs[leg1_idx].token_id) else {
+    let Some(top1) = top_of_book(&snap, &signal.legs[leg1_idx].token_id) else {
         warn!(
             signal_id = signal.signal_id,
             "leg1 token missing in snapshot; skip"
@@ -276,17 +324,17 @@ async fn process_signal_sim(
     let leg1_fill = match simulate_ioc_and_log(
         cfg,
         signal,
-        top1,
         trade_log,
         calibration_tx,
+        exec,
         OmsAction::FireLeg1,
         leg1_idx as i32,
         &signal.legs[leg1_idx].token_id,
         leg1_side,
         limit_price,
         leg1_req,
-        false,
-        "leg1",
+        "attempt=1|leg1",
+        top1,
     )
     .await
     {
@@ -316,16 +364,32 @@ async fn process_signal_sim(
 
     let max_chase_bps = max_chase_bps(cfg, signal.expected_net_bps);
     if signal.expected_net_bps.raw() < 0 || max_chase_bps.raw() <= 0 {
-        return flatten_positions(cfg, signal, snapshots, trade_log, calibration_tx, positions)
-            .await;
+        return flatten_positions(
+            cfg,
+            signal,
+            snapshots,
+            trade_log,
+            calibration_tx,
+            exec,
+            positions,
+        )
+        .await;
     }
 
     for &idx in &leg_idxs[1..] {
         let token_id = &signal.legs[idx].token_id;
-        let Some(top) = top_for_token(&snap, token_id) else {
+        let Some(top) = top_of_book(&snap, token_id) else {
             warn!(signal_id = signal.signal_id, %token_id, "token missing in snapshot; flatten");
-            return flatten_positions(cfg, signal, snapshots, trade_log, calibration_tx, positions)
-                .await;
+            return flatten_positions(
+                cfg,
+                signal,
+                snapshots,
+                trade_log,
+                calibration_tx,
+                exec,
+                positions,
+            )
+            .await;
         };
 
         let step1_bps = Bps::new(cfg.live.ladder_step1_bps);
@@ -343,21 +407,22 @@ async fn process_signal_sim(
             } else {
                 format!("max_chase_bps={}", max_chase_bps.raw())
             };
+            let notes = format!("attempt={attempt}|{notes}");
 
             let r = match simulate_ioc_and_log(
                 cfg,
                 signal,
-                top,
                 trade_log,
                 calibration_tx,
+                exec,
                 OmsAction::Chase,
                 idx as i32,
                 token_id,
                 signal.legs[idx].side,
                 px,
                 need,
-                force_chase_fail,
                 &notes,
+                top,
             )
             .await
             {
@@ -383,8 +448,16 @@ async fn process_signal_sim(
                     qty: filled,
                 });
             }
-            return flatten_positions(cfg, signal, snapshots, trade_log, calibration_tx, positions)
-                .await;
+            return flatten_positions(
+                cfg,
+                signal,
+                snapshots,
+                trade_log,
+                calibration_tx,
+                exec,
+                positions,
+            )
+            .await;
         }
 
         positions.push(PositionChunk {
@@ -402,6 +475,7 @@ async fn flatten_positions(
     snapshots: &Arc<Mutex<HashMap<String, MarketSnapshot>>>,
     trade_log: &mut CsvAppender,
     calibration_tx: &mpsc::Sender<CalibrationEvent>,
+    exec: &ExecutionGateway,
     mut positions: Vec<PositionChunk>,
 ) -> SignalOutcome {
     positions.retain(|p| p.qty.is_finite() && p.qty > 0.0 && !p.token_id.is_empty());
@@ -430,27 +504,28 @@ async fn flatten_positions(
 
         let mut still: Vec<PositionChunk> = Vec::new();
         for p in positions {
-            let Some(top) = top_for_token(&snap, &p.token_id) else {
+            let Some(top) = top_of_book(&snap, &p.token_id) else {
                 still.push(p);
                 continue;
             };
             let limit_price = top.best_bid * (1.0 - lvl.to_f64());
             let notes = format!("flatten_lvl_bps={}", lvl.raw());
+            let notes = format!("attempt={attempts_done}|{notes}");
 
             let r = match simulate_ioc_and_log(
                 cfg,
                 signal,
-                top,
                 trade_log,
                 calibration_tx,
+                exec,
                 OmsAction::Flatten,
                 -1,
                 &p.token_id,
                 Side::Sell,
                 limit_price,
                 p.qty,
-                false,
                 &notes,
+                top,
             )
             .await
             {
@@ -480,45 +555,46 @@ async fn flatten_positions(
 
 #[allow(clippy::too_many_arguments)]
 async fn simulate_ioc_and_log(
-    cfg: &Config,
+    _cfg: &Config,
     signal: &Signal,
-    top: TopOfBook,
     trade_log: &mut CsvAppender,
     calibration_tx: &mpsc::Sender<CalibrationEvent>,
+    exec: &ExecutionGateway,
     action: OmsAction,
     leg_index: i32,
     token_id: &str,
     side: Side,
     limit_price: f64,
     req_qty: f64,
-    force_fail: bool,
     notes: &str,
+    top: TopOfBook,
 ) -> Result<FillReport, String> {
-    tokio::time::sleep(Duration::from_millis(cfg.sim.sim_network_latency_ms)).await;
+    let kind = action
+        .exec_kind()
+        .ok_or_else(|| "not an executable action".to_string())?;
 
-    let sim_fill_share_used = sim_fill_share(cfg, signal.bucket);
-
-    let (filled_qty, status, avg_price) = if force_fail && action == OmsAction::Chase {
-        (0.0, FillStatus::None, 0.0)
-    } else {
-        sim_fill(
+    let exec_res = exec
+        .place_ioc(PlaceIocRequest {
+            kind,
+            bucket: signal.bucket,
+            token_id,
             side,
             limit_price,
             req_qty,
-            top.best_ask,
-            top.best_ask_size_best,
-            top.best_bid,
-            top.best_bid_size_best,
-            sim_fill_share_used,
-        )
-    };
+            top,
+        })
+        .await
+        .map_err(|e| format!("exec error: {e:#}"))?;
 
-    let report = FillReport {
-        requested_qty: req_qty,
-        filled_qty,
-        avg_price,
-        status,
-    };
+    let report = exec_res.fill;
+    let full_notes = format!(
+        "{notes}|order_id={}|latency_ms={}|spike_ms={}|book_dropped={}|sim_fill_share_used={}",
+        &report.order_id,
+        report.latency_ms,
+        exec_res.latency_spike_ms_applied,
+        exec_res.book_dropped,
+        exec_res.sim_fill_share_used
+    );
 
     write_trade_row(
         trade_log,
@@ -529,9 +605,9 @@ async fn simulate_ioc_and_log(
         side,
         limit_price,
         req_qty,
-        filled_qty,
-        status,
-        notes,
+        report.filled_qty,
+        report.status,
+        &full_notes,
     )
     .map_err(|e| format!("trade_log write failed: {e:#}"))?;
 
@@ -542,10 +618,10 @@ async fn simulate_ioc_and_log(
         token_id: token_id.to_string(),
         side,
         req_qty,
-        filled_qty,
-        market_ask_size_best: top.best_ask_size_best,
-        market_bid_size_best: top.best_bid_size_best,
-        sim_fill_share_used,
+        filled_qty: report.filled_qty,
+        market_ask_size_best: exec_res.top.best_ask_size_best,
+        market_bid_size_best: exec_res.top.best_bid_size_best,
+        sim_fill_share_used: exec_res.sim_fill_share_used,
         mode: "SIM".to_string(),
     };
     if calibration_tx.try_send(ev).is_err() {
@@ -556,72 +632,6 @@ async fn simulate_ioc_and_log(
     }
 
     Ok(report)
-}
-
-fn sim_fill_share(cfg: &Config, bucket: Bucket) -> f64 {
-    let raw = match bucket {
-        Bucket::Liquid => cfg.sim.sim_fill_share_liquid,
-        Bucket::Thin => cfg.sim.sim_fill_share_thin,
-    };
-    if !raw.is_finite() {
-        return 0.0;
-    }
-    raw.clamp(0.0, 1.0)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn sim_fill(
-    side: Side,
-    limit_price: f64,
-    req_qty: f64,
-    best_ask: f64,
-    best_ask_size_best: f64,
-    best_bid: f64,
-    best_bid_size_best: f64,
-    sim_fill_share_used: f64,
-) -> (f64, FillStatus, f64) {
-    if !limit_price.is_finite() || !req_qty.is_finite() || req_qty <= 0.0 {
-        return (0.0, FillStatus::None, 0.0);
-    }
-
-    match side {
-        Side::Buy => {
-            if !best_ask.is_finite() || best_ask <= 0.0 {
-                return (0.0, FillStatus::None, 0.0);
-            }
-            if limit_price + 1e-12 < best_ask {
-                return (0.0, FillStatus::None, 0.0);
-            }
-            let cap = (best_ask_size_best.max(0.0)) * sim_fill_share_used;
-            let filled = req_qty.min(cap).max(0.0);
-            let status = if filled <= 0.0 {
-                FillStatus::None
-            } else if filled + 1e-9 >= req_qty {
-                FillStatus::Full
-            } else {
-                FillStatus::Partial
-            };
-            (filled, status, limit_price)
-        }
-        Side::Sell => {
-            if !best_bid.is_finite() || best_bid <= 0.0 {
-                return (0.0, FillStatus::None, 0.0);
-            }
-            if limit_price - 1e-12 > best_bid {
-                return (0.0, FillStatus::None, 0.0);
-            }
-            let cap = (best_bid_size_best.max(0.0)) * sim_fill_share_used;
-            let filled = req_qty.min(cap).max(0.0);
-            let status = if filled <= 0.0 {
-                FillStatus::None
-            } else if filled + 1e-9 >= req_qty {
-                FillStatus::Full
-            } else {
-                FillStatus::Partial
-            };
-            (filled, status, limit_price)
-        }
-    }
 }
 
 fn max_chase_bps(cfg: &Config, expected_net_bps: Bps) -> Bps {
@@ -681,16 +691,6 @@ fn depth3_for_token(snap: &MarketSnapshot, token_id: &str) -> f64 {
         .unwrap_or(f64::INFINITY)
 }
 
-fn top_for_token(snap: &MarketSnapshot, token_id: &str) -> Option<TopOfBook> {
-    let leg = snap.legs.iter().find(|l| l.token_id == token_id)?;
-    Some(TopOfBook {
-        best_ask: leg.best_ask,
-        best_ask_size_best: leg.best_ask_size_best,
-        best_bid: leg.best_bid,
-        best_bid_size_best: leg.best_bid_size_best,
-    })
-}
-
 fn spawn_snapshot_ingest(
     snap_rx: &mut watch::Receiver<Option<MarketSnapshot>>,
     snapshots: Arc<Mutex<HashMap<String, MarketSnapshot>>>,
@@ -731,14 +731,20 @@ mod tests {
             run: crate::config::RunConfig {
                 data_dir: "data".into(),
                 market_ids: vec![],
+                snapshot_log_interval_ms: 1_000,
+                raw_ws_rotate_keep: 0,
             },
             schema_version: crate::schema::SCHEMA_VERSION.to_string(),
             brain: crate::config::BrainConfig::default(),
             buckets: crate::config::BucketConfig::default(),
             shadow: crate::config::ShadowConfig::default(),
+            market_select: crate::config::MarketSelectConfig::default(),
             report: crate::config::ReportConfig::default(),
             live: crate::config::LiveConfig {
                 enabled: false,
+                chain_id: 137,
+                private_key_env: "POLYGON_PRIVATE_KEY".to_string(),
+                api_key_nonce: 0,
                 chase_cap_bps: 200,
                 ladder_step1_bps: 10,
                 flatten_lvl1_bps: 100,
@@ -754,53 +760,5 @@ mod tests {
         assert_eq!(max_chase_bps(&cfg, Bps::new(10)).raw(), 5);
         assert_eq!(max_chase_bps(&cfg, Bps::new(401)).raw(), 200);
         assert_eq!(max_chase_bps(&cfg, Bps::new(-10)).raw(), 0);
-    }
-
-    #[test]
-    fn sim_fill_buy_is_deterministic() {
-        // limit < best_ask => none
-        let (filled, status, avg_px) =
-            sim_fill(Side::Buy, 0.49, 10.0, 0.50, 100.0, 0.49, 100.0, 0.10);
-        assert_eq!(filled, 0.0);
-        assert_eq!(status, FillStatus::None);
-        assert_eq!(avg_px, 0.0);
-
-        // limit >= best_ask, cap >= req => full
-        let (filled, status, avg_px) =
-            sim_fill(Side::Buy, 0.50, 10.0, 0.50, 200.0, 0.49, 200.0, 0.10);
-        assert_eq!(filled, 10.0);
-        assert_eq!(status, FillStatus::Full);
-        assert_eq!(avg_px, 0.50);
-
-        // cap < req => partial
-        let (filled, status, avg_px) =
-            sim_fill(Side::Buy, 0.50, 10.0, 0.50, 50.0, 0.49, 50.0, 0.10);
-        assert_eq!(filled, 5.0);
-        assert_eq!(status, FillStatus::Partial);
-        assert_eq!(avg_px, 0.50);
-    }
-
-    #[test]
-    fn sim_fill_sell_is_deterministic() {
-        // limit > best_bid => none
-        let (filled, status, avg_px) =
-            sim_fill(Side::Sell, 0.51, 10.0, 0.52, 100.0, 0.50, 100.0, 0.10);
-        assert_eq!(filled, 0.0);
-        assert_eq!(status, FillStatus::None);
-        assert_eq!(avg_px, 0.0);
-
-        // limit <= best_bid, cap >= req => full
-        let (filled, status, avg_px) =
-            sim_fill(Side::Sell, 0.50, 10.0, 0.52, 200.0, 0.50, 200.0, 0.10);
-        assert_eq!(filled, 10.0);
-        assert_eq!(status, FillStatus::Full);
-        assert_eq!(avg_px, 0.50);
-
-        // cap < req => partial
-        let (filled, status, avg_px) =
-            sim_fill(Side::Sell, 0.50, 10.0, 0.52, 50.0, 0.50, 50.0, 0.10);
-        assert_eq!(filled, 5.0);
-        assert_eq!(status, FillStatus::Partial);
-        assert_eq!(avg_px, 0.50);
     }
 }
