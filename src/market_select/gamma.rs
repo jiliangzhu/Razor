@@ -10,7 +10,12 @@ pub struct GammaMarket {
     pub gamma_id: String,
     pub condition_id: String,
     pub token_ids: Vec<String>,
-    pub strategy: String, // "binary" | "triangle"
+    pub strategy: String, // "binary" | "triangle" | "multi"
+    pub outcomes: Vec<String>,
+    pub event_id: Option<String>,
+    pub neg_risk_market_id: Option<String>,
+    pub fees_enabled: bool,
+    pub holding_rewards_enabled: bool,
     pub volume24hr: f64,
     pub liquidity: f64,
     pub end_date_rfc3339: Option<String>,
@@ -20,6 +25,7 @@ pub struct GammaMarket {
 }
 
 pub async fn fetch_candidate_pool(cfg: &Config, limit: usize) -> anyhow::Result<Vec<GammaMarket>> {
+    let filter_mode = crate::config::market_filter_mode_from_env();
     let client = reqwest::Client::builder()
         .user_agent(concat!("razor/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_millis(
@@ -67,11 +73,28 @@ pub async fn fetch_candidate_pool(cfg: &Config, limit: usize) -> anyhow::Result<
             Err(_) => continue,
         };
         let legs_n = token_ids.len();
-        if legs_n != 2 && legs_n != 3 {
+        if legs_n < 2 {
             continue;
         }
 
-        let strategy = if legs_n == 2 { "binary" } else { "triangle" }.to_string();
+        let strategy = if legs_n == 2 {
+            "binary"
+        } else if legs_n == 3 {
+            "triangle"
+        } else {
+            "multi"
+        }
+        .to_string();
+
+        let outcomes = get_string_vec(&v, "outcomes").unwrap_or_default();
+        let (event_id, neg_risk_market_id) = get_event_meta(&v);
+
+        let fees_enabled = get_bool(&v, "feesEnabled").unwrap_or(false);
+        let holding_rewards_enabled = get_bool(&v, "holdingRewardsEnabled").unwrap_or(false);
+
+        if !filter_mode.allows(fees_enabled, holding_rewards_enabled) {
+            continue;
+        }
 
         let volume24hr = get_f64(&v, "volume24hr").unwrap_or(0.0);
         let liquidity = get_f64(&v, "liquidityNum")
@@ -90,6 +113,11 @@ pub async fn fetch_candidate_pool(cfg: &Config, limit: usize) -> anyhow::Result<
             condition_id,
             token_ids,
             strategy,
+            outcomes,
+            event_id,
+            neg_risk_market_id,
+            fees_enabled,
+            holding_rewards_enabled,
             volume24hr,
             liquidity,
             end_date_rfc3339: end_date,
@@ -129,6 +157,59 @@ fn get_f64(v: &Value, key: &str) -> Option<f64> {
         return s.parse::<f64>().ok();
     }
     None
+}
+
+fn get_bool(v: &Value, key: &str) -> Option<bool> {
+    let obj = v.as_object()?;
+    let val = obj.get(key)?;
+    if let Some(b) = val.as_bool() {
+        return Some(b);
+    }
+    if let Some(s) = val.as_str() {
+        return match s.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn get_string_vec(v: &Value, key: &str) -> Option<Vec<String>> {
+    let obj = v.as_object()?;
+    let val = obj.get(key)?;
+    if let Some(arr) = val.as_array() {
+        let out: Vec<String> = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect();
+        return Some(out);
+    }
+    if let Some(s) = val.as_str() {
+        return serde_json::from_str::<Vec<String>>(s).ok();
+    }
+    None
+}
+
+fn get_event_meta(v: &Value) -> (Option<String>, Option<String>) {
+    let Some(obj) = v.as_object() else {
+        return (None, None);
+    };
+    let Some(events) = obj.get("events").and_then(|v| v.as_array()) else {
+        return (None, None);
+    };
+    for ev in events {
+        let Some(ev_obj) = ev.as_object() else { continue };
+        let event_id = ev_obj.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let neg_risk_market_id = ev_obj
+            .get("negRiskMarketID")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if event_id.is_some() || neg_risk_market_id.is_some() {
+            return (event_id, neg_risk_market_id);
+        }
+    }
+    (None, None)
 }
 
 fn parse_market_phase(end_date_rfc3339: &str) -> Option<ProbePhase> {

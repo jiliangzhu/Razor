@@ -23,7 +23,7 @@ struct Args {
     #[arg(long)]
     pool_limit: Option<usize>,
 
-    /// Prefer a single strategy to control variables (binary/triangle) or allow any.
+    /// Prefer a single strategy to control variables (binary/triangle/multi/neg_risk) or allow any.
     #[arg(long, value_enum)]
     prefer_strategy: Option<PreferStrategyArg>,
 
@@ -36,6 +36,8 @@ struct Args {
 enum PreferStrategyArg {
     Binary,
     Triangle,
+    Multi,
+    NegRisk,
     Any,
 }
 
@@ -44,6 +46,8 @@ impl From<PreferStrategyArg> for razor::market_select::PreferStrategy {
         match v {
             PreferStrategyArg::Binary => razor::market_select::PreferStrategy::Binary,
             PreferStrategyArg::Triangle => razor::market_select::PreferStrategy::Triangle,
+            PreferStrategyArg::Multi => razor::market_select::PreferStrategy::Multi,
+            PreferStrategyArg::NegRisk => razor::market_select::PreferStrategy::NegRisk,
             PreferStrategyArg::Any => razor::market_select::PreferStrategy::Any,
         }
     }

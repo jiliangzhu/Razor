@@ -22,6 +22,8 @@ use crate::types::now_ms;
 pub enum PreferStrategy {
     Binary,
     Triangle,
+    Multi,
+    NegRisk,
     Any,
 }
 
@@ -30,6 +32,8 @@ impl PreferStrategy {
         match self {
             PreferStrategy::Binary => "binary",
             PreferStrategy::Triangle => "triangle",
+            PreferStrategy::Multi => "multi",
+            PreferStrategy::NegRisk => "neg_risk",
             PreferStrategy::Any => "any",
         }
     }
@@ -42,6 +46,8 @@ impl std::str::FromStr for PreferStrategy {
         Ok(match s.trim().to_ascii_lowercase().as_str() {
             "binary" => PreferStrategy::Binary,
             "triangle" => PreferStrategy::Triangle,
+            "multi" => PreferStrategy::Multi,
+            "neg_risk" => PreferStrategy::NegRisk,
             _ => PreferStrategy::Any,
         })
     }
@@ -276,6 +282,8 @@ fn filter_by_prefer_strategy(
         .filter(|m| match prefer {
             PreferStrategy::Binary => m.strategy == "binary",
             PreferStrategy::Triangle => m.strategy == "triangle",
+            PreferStrategy::Multi => m.strategy == "multi",
+            PreferStrategy::NegRisk => m.neg_risk_market_id.is_some(),
             PreferStrategy::Any => true,
         })
         .collect()

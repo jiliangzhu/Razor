@@ -19,14 +19,50 @@ use crate::types::{now_ms, now_us, LegSnapshot, MarketDef, MarketSnapshot, Trade
 const RAW_WS_ROTATE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
+struct GammaEventMeta {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "negRiskMarketID")]
+    #[serde(default)]
+    neg_risk_market_id: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "enableNegRisk")]
+    #[serde(default)]
+    enable_neg_risk: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GammaMarket {
+    id: String,
     #[serde(rename = "conditionId")]
     condition_id: String,
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: String,
+    #[serde(default, deserialize_with = "deserialize_string_vec")]
+    outcomes: Vec<String>,
+    #[serde(rename = "feesEnabled")]
+    #[serde(default)]
+    fees_enabled: Option<bool>,
+    #[serde(rename = "holdingRewardsEnabled")]
+    #[serde(default)]
+    holding_rewards_enabled: Option<bool>,
+    #[serde(default)]
+    events: Vec<GammaEventMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GammaEventResponse {
+    #[allow(dead_code)]
+    id: String,
+    #[serde(default)]
+    markets: Vec<GammaMarket>,
+    #[serde(rename = "negRiskMarketID")]
+    #[serde(default)]
+    neg_risk_market_id: Option<String>,
 }
 
 pub async fn fetch_markets(cfg: &Config) -> anyhow::Result<Vec<MarketDef>> {
+    let filter_mode = crate::config::market_filter_mode_from_env();
     let client = reqwest::Client::builder()
         .user_agent(concat!("razor/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_millis(
@@ -36,47 +72,192 @@ pub async fn fetch_markets(cfg: &Config) -> anyhow::Result<Vec<MarketDef>> {
         .build()
         .context("build http client")?;
 
-    let mut out = Vec::with_capacity(cfg.run.market_ids.len());
+    let mut out: Vec<MarketDef> = Vec::new();
+    let mut expanded_events: HashSet<String> = HashSet::new();
+    let mut seen_conditions: HashSet<String> = HashSet::new();
+
     for id in &cfg.run.market_ids {
-        let url = format!(
-            "{}/markets",
-            cfg.polymarket.gamma_base.trim_end_matches('/')
-        );
-        let resp = client
-            .get(url)
-            .query(&[("id", id)])
-            .send()
-            .await
-            .with_context(|| format!("gamma markets?id={id}"))?;
-        let markets: Vec<GammaMarket> = resp.json().await.context("decode gamma market")?;
-        let Some(m) = markets.into_iter().next() else {
-            return Err(anyhow::anyhow!("gamma market id {id} not found"));
-        };
+        let m = fetch_gamma_market(&client, cfg, id).await?;
+        let (event_id, neg_risk_market_id) = event_meta(&m);
 
-        let token_ids: Vec<String> = serde_json::from_str(&m.clob_token_ids)
-            .with_context(|| format!("parse clobTokenIds for gamma market {id}"))?;
-
-        if token_ids.len() != 2 && token_ids.len() != 3 {
-            warn!(
-                market_id = %m.condition_id,
-                legs = token_ids.len(),
-                "skip market: Phase 1 supports 2-leg binary or 3-leg triangle only"
-            );
+        if let (Some(event_id), Some(group_id)) = (event_id.clone(), neg_risk_market_id.clone()) {
+            if expanded_events.insert(event_id.clone()) {
+                match fetch_gamma_event(&client, cfg, &event_id).await {
+                    Ok(event) => {
+                        let group_id = event
+                            .neg_risk_market_id
+                            .clone()
+                            .or(Some(group_id))
+                            .unwrap_or_default();
+                        let mut event_defs: Vec<MarketDef> = Vec::new();
+                        let mut event_ok = true;
+                        for em in event.markets {
+                            let def =
+                                build_market_def(em, Some(event_id.clone()), Some(group_id.clone()))
+                                    .with_context(|| {
+                                        format!("parse event market for event {}", event_id)
+                                    })?;
+                            if !filter_mode.allows(def.fees_enabled, def.holding_rewards_enabled) {
+                                event_ok = false;
+                                break;
+                            }
+                            if seen_conditions.insert(def.market_id.clone()) {
+                                event_defs.push(def);
+                            }
+                        }
+                        if event_ok {
+                            out.extend(event_defs);
+                        } else {
+                            warn!(
+                                event_id = %event_id,
+                                mode = ?filter_mode,
+                                "skip neg-risk event: market filter rejected"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(event_id = %event_id, error = %e, "skip neg-risk event: fetch failed");
+                    }
+                }
+            }
             continue;
         }
 
-        out.push(MarketDef {
-            market_id: m.condition_id,
-            token_ids,
-        });
+        let def = build_market_def(m, event_id, neg_risk_market_id)
+            .with_context(|| format!("parse gamma market {id}"))?;
+        if !filter_mode.allows(def.fees_enabled, def.holding_rewards_enabled) {
+            warn!(
+                market_id = %def.market_id,
+                mode = ?filter_mode,
+                "skip market: market filter rejected"
+            );
+            continue;
+        }
+        if seen_conditions.insert(def.market_id.clone()) {
+            out.push(def);
+        }
     }
 
     if out.is_empty() {
         return Err(anyhow::anyhow!(
-            "no usable markets loaded (need 2-leg or 3-leg markets)"
+            "no usable markets loaded (need >=2-leg markets with fees+rewards enabled)"
         ));
     }
     Ok(out)
+}
+
+async fn fetch_gamma_market(
+    client: &reqwest::Client,
+    cfg: &Config,
+    gamma_id: &str,
+) -> anyhow::Result<GammaMarket> {
+    let url = format!(
+        "{}/markets",
+        cfg.polymarket.gamma_base.trim_end_matches('/')
+    );
+    let resp = client
+        .get(url)
+        .query(&[("id", gamma_id)])
+        .send()
+        .await
+        .with_context(|| format!("gamma markets?id={gamma_id}"))?;
+    let markets: Vec<GammaMarket> = resp.json().await.context("decode gamma market")?;
+    markets
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("gamma market id {gamma_id} not found"))
+}
+
+async fn fetch_gamma_event(
+    client: &reqwest::Client,
+    cfg: &Config,
+    event_id: &str,
+) -> anyhow::Result<GammaEventResponse> {
+    let url = format!("{}/events", cfg.polymarket.gamma_base.trim_end_matches('/'));
+    let resp = client
+        .get(url)
+        .query(&[("id", event_id)])
+        .send()
+        .await
+        .with_context(|| format!("gamma events?id={event_id}"))?;
+    let events: Vec<GammaEventResponse> = resp.json().await.context("decode gamma event")?;
+    events
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("gamma event id {event_id} not found"))
+}
+
+fn event_meta(m: &GammaMarket) -> (Option<String>, Option<String>) {
+    for ev in &m.events {
+        let event_id = ev.id.clone();
+        let neg_risk_market_id = ev.neg_risk_market_id.clone();
+        if event_id.is_some() || neg_risk_market_id.is_some() {
+            return (event_id, neg_risk_market_id);
+        }
+    }
+    (None, None)
+}
+
+fn build_market_def(
+    m: GammaMarket,
+    event_id: Option<String>,
+    neg_risk_market_id: Option<String>,
+) -> anyhow::Result<MarketDef> {
+    let token_ids: Vec<String> = serde_json::from_str(&m.clob_token_ids)
+        .with_context(|| format!("parse clobTokenIds for gamma market {}", m.id))?;
+
+    if token_ids.len() < 2 {
+        anyhow::bail!(
+            "skip market: unsupported leg count {} for {}",
+            token_ids.len(),
+            m.condition_id
+        );
+    }
+
+    let (yes_token_id, no_token_id) = yes_no_tokens(&token_ids, &m.outcomes);
+
+    Ok(MarketDef {
+        gamma_id: m.id,
+        market_id: m.condition_id,
+        token_ids,
+        outcomes: m.outcomes,
+        event_id,
+        neg_risk_market_id,
+        fees_enabled: m.fees_enabled.unwrap_or(false),
+        holding_rewards_enabled: m.holding_rewards_enabled.unwrap_or(false),
+        yes_token_id,
+        no_token_id,
+    })
+}
+
+fn yes_no_tokens(token_ids: &[String], outcomes: &[String]) -> (Option<String>, Option<String>) {
+    let yes_idx = find_outcome_index(outcomes, "yes");
+    let no_idx = find_outcome_index(outcomes, "no");
+    let yes = yes_idx.and_then(|i| token_ids.get(i).cloned());
+    let no = no_idx.and_then(|i| token_ids.get(i).cloned());
+    (yes, no)
+}
+
+fn find_outcome_index(outcomes: &[String], target: &str) -> Option<usize> {
+    let target = target.to_ascii_lowercase();
+    outcomes.iter().position(|o| o.trim().to_ascii_lowercase() == target)
+}
+
+fn deserialize_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::Array(arr) => Ok(arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()),
+        serde_json::Value::String(s) => serde_json::from_str::<Vec<String>>(&s)
+            .map_err(serde::de::Error::custom),
+        serde_json::Value::Null => Ok(Vec::new()),
+        _ => Ok(Vec::new()),
+    }
 }
 
 struct LegState {
@@ -514,6 +695,7 @@ fn maybe_publish_snapshot(state: &MarketState, snap_tx: &watch::Sender<Option<Ma
             .legs
             .iter()
             .map(|l| LegSnapshot {
+                market_id: state.market_id.clone(),
                 token_id: l.token_id.clone(),
                 best_ask: l.best_ask,
                 best_bid: l.best_bid,

@@ -58,6 +58,11 @@ pub struct MarketScoreRow {
     pub token0_id: String,
     pub token1_id: String,
     pub token2_id: String,
+    pub event_id: String,
+    pub neg_risk_market_id: String,
+    pub fees_enabled: bool,
+    pub holding_rewards_enabled: bool,
+    pub legs_json: String,
     pub gamma_volume24hr: f64,
     pub gamma_liquidity: f64,
     pub snapshots_total: u64,
@@ -193,6 +198,11 @@ pub fn compute_row(
     legs_n: usize,
     strategy: &str,
     token_ids: &[String],
+    outcomes: &[String],
+    event_id: &str,
+    neg_risk_market_id: &str,
+    fees_enabled: bool,
+    holding_rewards_enabled: bool,
     gamma_volume24hr: f64,
     gamma_liquidity: f64,
     phase: ProbePhase,
@@ -296,6 +306,11 @@ pub fn compute_row(
             token0_id: token0,
             token1_id: token1,
             token2_id: token2,
+            event_id: event_id.to_string(),
+            neg_risk_market_id: neg_risk_market_id.to_string(),
+            fees_enabled,
+            holding_rewards_enabled,
+            legs_json: legs_json(token_ids, outcomes),
             gamma_volume24hr,
             gamma_liquidity,
             snapshots_total: snap.snapshots_total,
@@ -329,6 +344,26 @@ pub fn compute_row(
         bucket_after_degrade: BUCKET_AFTER_DEGRADE,
         probe_warnings: warnings,
     }
+}
+
+#[derive(Serialize)]
+struct MarketLegJson<'a> {
+    leg_index: usize,
+    token_id: &'a str,
+    outcome: &'a str,
+}
+
+fn legs_json(token_ids: &[String], outcomes: &[String]) -> String {
+    let items: Vec<MarketLegJson<'_>> = token_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, token_id)| MarketLegJson {
+            leg_index: idx,
+            token_id: token_id.as_str(),
+            outcome: outcomes.get(idx).map(|s| s.as_str()).unwrap_or(""),
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
 pub fn compute_expected_net_bps(sum_ask: f64, risk_premium_bps: i32) -> Option<i32> {

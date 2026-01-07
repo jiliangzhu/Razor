@@ -3,7 +3,7 @@
 更新时间：2025-12-31  
 目标：把 `docs/the_smart_ape.md` 里的“工程方法论”（自建数据集 + 多参数回测 + 明确承认回测局限）转成 Razor 的**可执行 backlog**，用于持续提升套利能力与 Day14 判决可信度。
 
-> 本 backlog 以 **Frozen Spec v1.3.2a** 为前提：任何会改变 Brain/Shadow 公式含义、或更改已冻结 CSV schema 的事项，都必须单独开 “Spec bump PR” 并写迁移说明。
+> 本 backlog 以 **Frozen Spec v1.4.0** 为前提：任何会改变 Brain/Shadow 公式含义、或更改已冻结 CSV schema 的事项，都必须单独开 “Spec bump PR” 并写迁移说明。
 
 ---
 
@@ -292,4 +292,3 @@ cargo test
 ```
 3) smoke（按该 PR 新增工具给出一条可跑命令）  
 4) 验收产物：输出文件路径 + header（CSV）或关键字段（JSON）  
-

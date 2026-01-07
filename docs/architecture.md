@@ -83,7 +83,8 @@ graph TD
 ### 2.2 最小市场快照（热路径）
 只保留：
 - `market_id`
-- `legs: Vec<LegSnapshot>`，每腿：
+- `legs: Vec<LegSnapshot>`（N 腿）
+  - `market_id`（腿所属 condition_id；跨市场组装时用于追溯）
   - `token_id`
   - `best_ask`, `best_bid`（f64）
   - `ask_depth3_usdc`（前三档卖盘名义 USDC：Σ px*sz）
@@ -94,7 +95,7 @@ Shadow 会计输入：
 - `signal_id`
 - `signal_ts_ms`
 - `market_id`
-- `strategy`（binary / triangle）
+- `strategy`（binary / triangle / multi / neg_risk）
 - `bucket`（Liquid / Thin）
 - `q_req`
 - `expected_net_bps: Bps`
@@ -140,8 +141,15 @@ Brain + Shadow 共享桶逻辑。对每条腿 i：
 在源头掐死“看起来赚钱其实负期望”的机会。
 
 ### Bps 域净优势
-令 `sum_prices = Σ best_ask_i`：
+对 Binary/Triangle/Multi：
+- `sum_prices = Σ best_ask_i`
 - `raw_cost_bps = ceil(sum_prices * 10000)`（成本侧向上取整，避免虚高 edge）
+- `raw_edge_bps = 10000 - raw_cost_bps`
+
+NegRisk（负风险转换等价 set）：
+- 事件内每个 outcome i：  
+  `cost_i = best_ask(NO_i) + Σ_{j != i} best_ask(YES_j)`
+- 取 `cost_i` 最小者作为 `raw_cost_bps`
 - `raw_edge_bps = 10000 - raw_cost_bps`
 
 成本（Bps）：
@@ -156,6 +164,8 @@ Brain + Shadow 共享桶逻辑。对每条腿 i：
 Phase 1 策略范围：
 - S1 Binary（2 腿）
 - S2 Triangle（3 腿）
+- S3 Multi（N 腿，N >= 4）
+- S4 NegRisk（事件内：1 条 NO + 其余 YES，构成完整 set）
 
 ---
 
@@ -214,8 +224,8 @@ Phase 1 策略范围：
 ### trades.csv（最小）
 - `ts_ms, market_id, token_id, price, size, trade_id, ingest_ts_ms, exchange_ts_ms`
 
-### shadow_log.csv（建议固定列，Phase 1 最多 3 腿）
-建议采用固定宽表（最多 3 腿），并写全成套/残渣拆账中间量，便于追责与复盘。
+### shadow_log.csv（固定列 + legs_json）
+建议采用固定宽表（前 3 腿直列），并写全成套/残渣拆账中间量，便于追责与复盘。所有腿以 `legs_json` 完整保存。
 权威 header 以代码为准：`src/schema.rs::SHADOW_HEADER`。
 
 ---

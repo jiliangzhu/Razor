@@ -180,6 +180,8 @@ impl SubAssign for Bps {
 pub enum Strategy {
     Binary,
     Triangle,
+    Multi,
+    NegRisk,
 }
 
 impl Strategy {
@@ -187,6 +189,8 @@ impl Strategy {
         match self {
             Strategy::Binary => "binary",
             Strategy::Triangle => "triangle",
+            Strategy::Multi => "multi",
+            Strategy::NegRisk => "neg_risk",
         }
     }
 }
@@ -210,6 +214,7 @@ pub type Bucket = LiquidityBucket;
 
 #[derive(Clone, Debug)]
 pub struct LegSnapshot {
+    pub market_id: String,
     pub token_id: String,
     pub best_ask: f64,
     #[allow(dead_code)]
@@ -248,6 +253,7 @@ impl Side {
 #[derive(Clone, Debug)]
 pub struct SignalLeg {
     pub leg_index: usize,
+    pub market_id: String,
     pub token_id: String,
     #[allow(dead_code)]
     pub side: Side,
@@ -341,8 +347,19 @@ pub struct BucketMetrics {
 
 #[derive(Clone, Debug)]
 pub struct MarketDef {
+    #[allow(dead_code)]
+    pub gamma_id: String,
     pub market_id: String,
     pub token_ids: Vec<String>,
+    #[allow(dead_code)]
+    pub outcomes: Vec<String>,
+    #[allow(dead_code)]
+    pub event_id: Option<String>,
+    pub neg_risk_market_id: Option<String>,
+    pub fees_enabled: bool,
+    pub holding_rewards_enabled: bool,
+    pub yes_token_id: Option<String>,
+    pub no_token_id: Option<String>,
 }
 
 impl MarketDef {
@@ -350,7 +367,8 @@ impl MarketDef {
         match self.token_ids.len() {
             2 => Ok(Strategy::Binary),
             3 => Ok(Strategy::Triangle),
-            n => anyhow::bail!("unsupported leg count {n} (Phase 1 supports 2 or 3)"),
+            n if n >= 4 => Ok(Strategy::Multi),
+            n => anyhow::bail!("unsupported leg count {n} (Phase 1 supports >= 2)"),
         }
     }
 }

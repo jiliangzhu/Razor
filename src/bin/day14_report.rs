@@ -109,6 +109,8 @@ struct ShadowAnalysis {
 
     signals_binary: u64,
     signals_triangle: u64,
+    signals_multi: u64,
+    signals_neg_risk: u64,
     signals_other: u64,
 
     buckets_liquid: u64,
@@ -182,6 +184,8 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
 
     let mut signals_binary: u64 = 0;
     let mut signals_triangle: u64 = 0;
+    let mut signals_multi: u64 = 0;
+    let mut signals_neg_risk: u64 = 0;
     let mut signals_other: u64 = 0;
 
     let mut buckets_liquid: u64 = 0;
@@ -293,6 +297,8 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
         let strategy_key = match strategy_raw.as_str() {
             "binary" => "binary",
             "triangle" => "triangle",
+            "multi" => "multi",
+            "neg_risk" => "neg_risk",
             _ => "other",
         }
         .to_string();
@@ -319,6 +325,8 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
         match strategy_key.as_str() {
             "binary" => signals_binary += 1,
             "triangle" => signals_triangle += 1,
+            "multi" => signals_multi += 1,
+            "neg_risk" => signals_neg_risk += 1,
             _ => signals_other += 1,
         }
         match bucket_key.as_str() {
@@ -394,6 +402,8 @@ fn analyze_shadow_log(shadow_log_path: &Path, run_id: &str) -> anyhow::Result<Sh
         rows_ok,
         signals_binary,
         signals_triangle,
+        signals_multi,
+        signals_neg_risk,
         signals_other,
         buckets_liquid,
         buckets_thin,
@@ -461,8 +471,8 @@ fn print_overall_section(a: &ShadowAnalysis, starting_capital: Option<f64>) {
     println!("rows_other_run={}", a.rows_other_run);
     println!("rows_schema_version_mismatch={}", a.rows_schema_mismatch);
     println!(
-        "signals_by_strategy=binary:{} triangle:{} other:{}",
-        a.signals_binary, a.signals_triangle, a.signals_other
+        "signals_by_strategy=binary:{} triangle:{} multi:{} neg_risk:{} other:{}",
+        a.signals_binary, a.signals_triangle, a.signals_multi, a.signals_neg_risk, a.signals_other
     );
     println!(
         "signals_by_bucket=liquid:{} thin:{} unknown:{}",

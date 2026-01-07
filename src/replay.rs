@@ -12,6 +12,7 @@ use crate::schema::{
     FILE_TRADES, SCHEMA_VERSION, SHADOW_HEADER, SNAPSHOTS_HEADER, TRADES_HEADER,
 };
 use crate::types::{Bps, LegSnapshot, MarketSnapshot, Signal, SignalLeg, Strategy, TradeTick};
+use serde::{Deserialize, Serialize};
 
 pub const FILE_REPLAY_SHADOW_LOG: &str = "replay_shadow_log.csv";
 pub const FILE_REPLAY_REPORT_JSON: &str = "replay_report.json";
@@ -112,6 +113,7 @@ fn generate_signals(cfg: &Config, run_id: &str, snapshots: &[TimedSnapshot]) -> 
         let strategy = match snap.legs.len() {
             2 => Strategy::Binary,
             3 => Strategy::Triangle,
+            n if n >= 4 => Strategy::Multi,
             _ => continue,
         };
 
@@ -149,6 +151,7 @@ fn generate_signals(cfg: &Config, run_id: &str, snapshots: &[TimedSnapshot]) -> 
             .enumerate()
             .map(|(idx, l)| SignalLeg {
                 leg_index: idx,
+                market_id: l.market_id.clone(),
                 token_id: l.token_id.clone(),
                 side: crate::types::Side::Buy,
                 limit_price: l.best_ask,
@@ -199,7 +202,7 @@ fn write_replay_shadow_log(
 
     for s in signals {
         let legs_n = s.legs.len();
-        if !(2..=3).contains(&legs_n) {
+        if legs_n < 2 {
             continue;
         }
 
@@ -211,16 +214,16 @@ fn write_replay_shadow_log(
         let mut legs_sorted = s.legs.clone();
         legs_sorted.sort_by_key(|l| l.leg_index);
 
-        let mut v_mkt: [f64; 3] = [0.0, 0.0, 0.0];
-        let mut q_fill: [f64; 3] = [0.0, 0.0, 0.0];
+        let mut v_mkt: Vec<f64> = vec![0.0; legs_n];
+        let mut q_fill: Vec<f64> = vec![0.0; legs_n];
 
         let mut invalid_limit = false;
-        for (i, leg) in legs_sorted.iter().take(3).enumerate() {
+        for (i, leg) in legs_sorted.iter().enumerate() {
             if !leg.limit_price.is_finite() || leg.limit_price <= 0.0 {
                 invalid_limit = true;
                 continue;
             }
-            let key = (s.market_id.clone(), leg.token_id.clone());
+            let key = (leg.market_id.clone(), leg.token_id.clone());
             if let Some(trades) = trades_by_key.get(&key) {
                 v_mkt[i] = volume_at_or_better_price(
                     trades,
@@ -232,7 +235,7 @@ fn write_replay_shadow_log(
             q_fill[i] = (v_mkt[i] * fill_share_used).min(s.q_req);
         }
 
-        let q_set = q_fill[..legs_n]
+        let q_set = q_fill
             .iter()
             .copied()
             .fold(f64::INFINITY, f64::min)
@@ -249,8 +252,12 @@ fn write_replay_shadow_log(
 
         let dump_slippage_assumed = crate::schema::DUMP_SLIPPAGE_ASSUMED;
         let mut pnl_left_total: f64 = 0.0;
-        for (i, leg) in legs_sorted.iter().take(3).enumerate() {
-            let q_left = q_fill[i] - q_set;
+        let mut q_left: Vec<f64> = vec![0.0; legs_n];
+        for i in 0..legs_n {
+            q_left[i] = q_fill[i] - q_set;
+        }
+        for (i, leg) in legs_sorted.iter().enumerate() {
+            let q_left = q_left[i];
             if q_left <= 0.0 {
                 continue;
             }
@@ -261,17 +268,38 @@ fn write_replay_shadow_log(
         }
 
         let total_pnl = pnl_set + pnl_left_total;
-        let q_fill_avg = q_fill[..legs_n].iter().sum::<f64>() / (legs_n as f64);
+        let q_fill_avg = q_fill.iter().sum::<f64>() / (legs_n as f64);
         let set_ratio = if q_fill_avg > 0.0 {
             q_set / q_fill_avg
         } else {
             0.0
         };
 
+        let mut legs_out: Vec<SignalLeg> = legs_sorted.iter().take(3).cloned().collect();
+        while legs_out.len() < 3 {
+            legs_out.push(SignalLeg {
+                leg_index: legs_out.len(),
+                market_id: String::new(),
+                token_id: String::new(),
+                side: crate::types::Side::Buy,
+                limit_price: 0.0,
+                qty: 0.0,
+                best_bid_at_signal: 0.0,
+                best_ask_at_signal: 0.0,
+            });
+        }
+        let mut v_mkt_out: Vec<f64> = v_mkt.iter().take(3).copied().collect();
+        let mut q_fill_out: Vec<f64> = q_fill.iter().take(3).copied().collect();
+        while v_mkt_out.len() < 3 {
+            v_mkt_out.push(0.0);
+        }
+        while q_fill_out.len() < 3 {
+            q_fill_out.push(0.0);
+        }
+
         let window_stats = window_stats_for_signal(
             trades_by_key,
-            &s.market_id,
-            &legs_sorted[..legs_n],
+            &legs_sorted,
             window_start_ms,
             window_end_ms,
         );
@@ -316,7 +344,7 @@ fn write_replay_shadow_log(
             reasons.push(ShadowNoteReason::WindowDataGap);
         }
 
-        let v_mkt_sum: f64 = v_mkt[..legs_n].iter().sum();
+        let v_mkt_sum: f64 = v_mkt.iter().sum();
         if v_mkt_sum <= 0.0 {
             reasons.push(ShadowNoteReason::NoTrades);
         }
@@ -366,20 +394,11 @@ fn write_replay_shadow_log(
         record.push(q_set.to_string());
 
         for i in 0..3 {
-            if i < legs_n {
-                let leg = &s.legs[i];
-                record.push(leg.token_id.clone());
-                record.push(leg.limit_price.to_string());
-                record.push(leg.best_bid_at_signal.to_string());
-                record.push(v_mkt[i].to_string());
-                record.push(q_fill[i].to_string());
-            } else {
-                record.push(String::new());
-                record.push("0".to_string());
-                record.push("0".to_string());
-                record.push("0".to_string());
-                record.push("0".to_string());
-            }
+            record.push(legs_out[i].token_id.clone());
+            record.push(legs_out[i].limit_price.to_string());
+            record.push(legs_out[i].best_bid_at_signal.to_string());
+            record.push(v_mkt_out[i].to_string());
+            record.push(q_fill_out[i].to_string());
         }
 
         record.push(cost_set.to_string());
@@ -391,6 +410,7 @@ fn write_replay_shadow_log(
         record.push(set_ratio.to_string());
         record.push(fill_share_used.to_string());
         record.push(dump_slippage_assumed.to_string());
+        record.push(legs_json(&s.legs));
         record.push(notes);
         debug_assert_eq!(record.len(), SHADOW_HEADER.len());
         wtr.write_record(record).context("write replay row")?;
@@ -398,6 +418,36 @@ fn write_replay_shadow_log(
 
     wtr.flush().context("flush replay shadow_log")?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct ShadowLegJson<'a> {
+    leg_index: usize,
+    market_id: &'a str,
+    token_id: &'a str,
+    side: &'a str,
+    limit_price: f64,
+    qty: f64,
+    best_bid_at_signal: f64,
+    best_ask_at_signal: f64,
+}
+
+fn legs_json(legs: &[SignalLeg]) -> String {
+    let items: Vec<ShadowLegJson<'_>> = legs
+        .iter()
+        .filter(|l| !l.token_id.trim().is_empty())
+        .map(|l| ShadowLegJson {
+            leg_index: l.leg_index,
+            market_id: l.market_id.as_str(),
+            token_id: l.token_id.as_str(),
+            side: l.side.as_str(),
+            limit_price: l.limit_price,
+            qty: l.qty,
+            best_bid_at_signal: l.best_bid_at_signal,
+            best_ask_at_signal: l.best_ask_at_signal,
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn volume_at_or_better_price(
@@ -458,29 +508,35 @@ fn read_snapshots_csv(path: &Path) -> anyhow::Result<Vec<TimedSnapshot>> {
         let ts_ms = record.get(0).and_then(parse_u64).context("ts_ms")?;
         let market_id = record.get(1).unwrap_or("").trim().to_string();
         let legs_n = record.get(2).and_then(parse_u64).context("legs_n")? as usize;
-        if !(2..=3).contains(&legs_n) {
+        if legs_n < 2 {
             continue;
         }
 
-        let mut legs: Vec<LegSnapshot> = Vec::with_capacity(legs_n);
-        for i in 0..legs_n {
-            let base = 3 + i * 4;
-            let token_id = record.get(base).unwrap_or("").trim().to_string();
-            if token_id.is_empty() {
-                continue;
+        let legs_json_raw = record.get(15).unwrap_or("").trim();
+        let mut legs = parse_legs_json(legs_json_raw, &market_id, ts_ms).unwrap_or_default();
+        if legs.is_empty() {
+            let mut fallback: Vec<LegSnapshot> = Vec::with_capacity(legs_n.min(3));
+            for i in 0..legs_n.min(3) {
+                let base = 3 + i * 4;
+                let token_id = record.get(base).unwrap_or("").trim().to_string();
+                if token_id.is_empty() {
+                    continue;
+                }
+                let best_bid = record.get(base + 1).and_then(parse_f64).unwrap_or(0.0);
+                let best_ask = record.get(base + 2).and_then(parse_f64).unwrap_or(1.0);
+                let depth3 = record.get(base + 3).and_then(parse_f64).unwrap_or(f64::NAN);
+                fallback.push(LegSnapshot {
+                    market_id: market_id.clone(),
+                    token_id,
+                    best_bid,
+                    best_ask,
+                    best_ask_size_best: 0.0,
+                    best_bid_size_best: 0.0,
+                    ask_depth3_usdc: depth3,
+                    ts_recv_us: ts_ms * 1000,
+                });
             }
-            let best_bid = record.get(base + 1).and_then(parse_f64).unwrap_or(0.0);
-            let best_ask = record.get(base + 2).and_then(parse_f64).unwrap_or(1.0);
-            let depth3 = record.get(base + 3).and_then(parse_f64).unwrap_or(f64::NAN);
-            legs.push(LegSnapshot {
-                token_id,
-                best_bid,
-                best_ask,
-                best_ask_size_best: 0.0,
-                best_bid_size_best: 0.0,
-                ask_depth3_usdc: depth3,
-                ts_recv_us: ts_ms * 1000,
-            });
+            legs = fallback;
         }
         if legs.len() != legs_n {
             continue;
@@ -493,6 +549,51 @@ fn read_snapshots_csv(path: &Path) -> anyhow::Result<Vec<TimedSnapshot>> {
     }
     out.sort_by_key(|s| s.ts_ms);
     Ok(out)
+}
+
+#[derive(Deserialize)]
+struct SnapshotLegJson {
+    leg_index: usize,
+    market_id: String,
+    token_id: String,
+    best_bid: f64,
+    best_ask: f64,
+    depth3_usdc: f64,
+}
+
+fn parse_legs_json(
+    raw: &str,
+    fallback_market_id: &str,
+    ts_ms: u64,
+) -> Option<Vec<LegSnapshot>> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut legs: Vec<SnapshotLegJson> = serde_json::from_str(raw).ok()?;
+    legs.sort_by_key(|l| l.leg_index);
+    let out: Vec<LegSnapshot> = legs
+        .into_iter()
+        .filter(|l| !l.token_id.trim().is_empty())
+        .map(|l| LegSnapshot {
+            market_id: if l.market_id.trim().is_empty() {
+                fallback_market_id.to_string()
+            } else {
+                l.market_id
+            },
+            token_id: l.token_id,
+            best_bid: l.best_bid,
+            best_ask: l.best_ask,
+            best_ask_size_best: 0.0,
+            best_bid_size_best: 0.0,
+            ask_depth3_usdc: l.depth3_usdc,
+            ts_recv_us: ts_ms * 1000,
+        })
+        .collect();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn read_trades_by_key(path: &Path) -> anyhow::Result<HashMap<(String, String), Vec<TradeLite>>> {
@@ -556,71 +657,46 @@ fn parse_trade_tick(record: &csv::StringRecord) -> anyhow::Result<TradeTick> {
 
 fn window_stats_for_signal(
     trades_by_key: &HashMap<(String, String), Vec<TradeLite>>,
-    market_id: &str,
     legs: &[SignalLeg],
     start_ms: u64,
     end_ms: u64,
 ) -> crate::trade_store::WindowStats {
-    if market_id.trim().is_empty() || start_ms > end_ms || legs.is_empty() {
+    if start_ms > end_ms || legs.is_empty() {
         return crate::trade_store::WindowStats::default();
     }
 
-    let mut leg_trades: Vec<&[TradeLite]> = Vec::with_capacity(legs.len());
-    for leg in legs.iter().take(3) {
-        let key = (market_id.to_string(), leg.token_id.clone());
-        if let Some(v) = trades_by_key.get(&key) {
-            leg_trades.push(v.as_slice());
-        } else {
-            leg_trades.push(&[]);
+    let mut ts_samples: Vec<u64> = Vec::new();
+    for leg in legs {
+        if leg.market_id.trim().is_empty() || leg.token_id.trim().is_empty() {
+            continue;
         }
-    }
-
-    let mut idx: [usize; 3] = [0, 0, 0];
-    for (i, t) in leg_trades.iter().enumerate().take(3) {
-        idx[i] = lower_bound(t, start_ms);
-    }
-
-    let mut trades_in_window: usize = 0;
-    let mut max_gap_ms: u64 = 0;
-    let mut prev_ts: Option<u64> = None;
-
-    loop {
-        let mut best_leg: Option<usize> = None;
-        let mut best_ts: u64 = 0;
-
-        for i in 0..leg_trades.len().min(3) {
-            let t = leg_trades[i];
-            if idx[i] >= t.len() {
-                continue;
-            }
-            let ts = t[idx[i]].ts_ms;
-            if ts > end_ms {
-                continue;
-            }
-            if best_leg.is_none() || ts < best_ts {
-                best_leg = Some(i);
-                best_ts = ts;
-            }
-        }
-
-        let Some(i) = best_leg else {
-            break;
+        let key = (leg.market_id.clone(), leg.token_id.clone());
+        let Some(trades) = trades_by_key.get(&key) else {
+            continue;
         };
-
-        idx[i] += 1;
-        trades_in_window += 1;
-        if let Some(prev) = prev_ts {
-            max_gap_ms = max_gap_ms.max(best_ts.saturating_sub(prev));
+        let start_idx = lower_bound(trades, start_ms);
+        for t in &trades[start_idx..] {
+            if t.ts_ms > end_ms {
+                break;
+            }
+            ts_samples.push(t.ts_ms);
         }
-        prev_ts = Some(best_ts);
     }
 
-    if trades_in_window == 0 {
+    if ts_samples.is_empty() {
         return crate::trade_store::WindowStats::default();
+    }
+
+    ts_samples.sort_unstable();
+    let mut max_gap_ms: u64 = 0;
+    for pair in ts_samples.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        max_gap_ms = max_gap_ms.max(b.saturating_sub(a));
     }
 
     crate::trade_store::WindowStats {
-        trades_in_window,
+        trades_in_window: ts_samples.len(),
         max_gap_ms,
         max_trade_size: 0.0,
         max_trade_notional: 0.0,
@@ -671,7 +747,7 @@ mod tests {
     fn snapshots_header_is_strict() {
         assert_eq!(
             SNAPSHOTS_HEADER.join(","),
-            "ts_ms,market_id,legs_n,leg0_token_id,leg0_best_bid,leg0_best_ask,leg0_depth3_usdc,leg1_token_id,leg1_best_bid,leg1_best_ask,leg1_depth3_usdc,leg2_token_id,leg2_best_bid,leg2_best_ask,leg2_depth3_usdc"
+            "ts_ms,market_id,legs_n,leg0_token_id,leg0_best_bid,leg0_best_ask,leg0_depth3_usdc,leg1_token_id,leg1_best_bid,leg1_best_ask,leg1_depth3_usdc,leg2_token_id,leg2_best_bid,leg2_best_ask,leg2_depth3_usdc,legs_json"
         );
     }
 

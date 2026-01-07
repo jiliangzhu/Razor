@@ -112,11 +112,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let markets = feed::fetch_markets(&cfg).await.context("fetch markets")?;
-    let (mut binary, mut triangle) = (0usize, 0usize);
+    let (mut binary, mut triangle, mut multi) = (0usize, 0usize, 0usize);
     for m in &markets {
         match m.strategy().context("market strategy")? {
             Strategy::Binary => binary += 1,
             Strategy::Triangle => triangle += 1,
+            Strategy::Multi => multi += 1,
+            Strategy::NegRisk => {}
         }
     }
     info!(
@@ -124,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         token_count = markets.iter().map(|m| m.token_ids.len()).sum::<usize>(),
         binary,
         triangle,
+        multi,
         "loaded markets"
     );
 

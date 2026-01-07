@@ -1,6 +1,6 @@
-# AGENTS.md — Project Razor v1.3.2a 执行规则（冻结）
+# AGENTS.md — Project Razor v1.4.0 执行规则（冻结）
 
-本仓库遵循 **Frozen Spec v1.3.2a**。唯一使命：
+本仓库遵循 **Frozen Spec v1.4.0**。唯一使命：
 > 在 Day 14 用“成套会计 + 残渣处刑”的口径，给这个 idea 判死刑或判活。
 
 ---

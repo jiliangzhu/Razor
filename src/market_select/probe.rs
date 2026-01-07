@@ -240,6 +240,11 @@ pub async fn probe_market(
         m.token_ids.len(),
         &m.strategy,
         &m.token_ids,
+        &m.outcomes,
+        m.event_id.as_deref().unwrap_or(""),
+        m.neg_risk_market_id.as_deref().unwrap_or(""),
+        m.fees_enabled,
+        m.holding_rewards_enabled,
         m.volume24hr,
         m.liquidity,
         m.market_phase,
@@ -292,6 +297,7 @@ fn sample_snapshot(
             depth3 = 0.0; // force degrade in bucket classifier
         }
         snap_legs.push(LegSnapshot {
+            market_id: m.condition_id.clone(),
             token_id: l.token_id.clone(),
             best_ask: l.best_ask,
             best_bid: l.best_bid,

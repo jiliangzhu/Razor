@@ -24,7 +24,9 @@ pub fn select_two_markets(
     let liquid = pick_liquid(&eligible).context("pick liquid")?;
     let thin = pick_thin(&eligible, &liquid.row.gamma_id).context("pick thin")?;
 
-    if prefer_strategy != PreferStrategy::Any && liquid.row.strategy != thin.row.strategy {
+    if !matches!(prefer_strategy, PreferStrategy::Any | PreferStrategy::NegRisk)
+        && liquid.row.strategy != thin.row.strategy
+    {
         anyhow::bail!(
             "prefer_strategy={} requires same strategy; liquid={} thin={}",
             prefer_strategy.as_str(),
@@ -41,7 +43,7 @@ pub fn select_two_markets(
 
 fn passes_hard_gates(r: &MarketScoreRowComputed) -> bool {
     let row = &r.row;
-    if row.legs_n != 2 && row.legs_n != 3 {
+    if row.legs_n < 2 {
         return false;
     }
     if row.snapshots_total < 300 {
@@ -144,6 +146,11 @@ mod tests {
                 token0_id: "t0".into(),
                 token1_id: "t1".into(),
                 token2_id: "".into(),
+                event_id: "".into(),
+                neg_risk_market_id: "".into(),
+                fees_enabled: true,
+                holding_rewards_enabled: true,
+                legs_json: "[]".into(),
                 gamma_volume24hr: 100.0,
                 gamma_liquidity: 100.0,
                 snapshots_total: 300,

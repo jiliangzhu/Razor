@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use crate::recorder::{CsvAppender, SHADOW_HEADER};
 use crate::schema::{DUMP_SLIPPAGE_ASSUMED, SCHEMA_VERSION};
 use crate::trade_store::TradeStore;
 use crate::types::{now_ms, Bps, Leg, MarketDef, Side, Signal, TradeTick};
+use serde::Serialize;
 
 const LEFTOVER_DUMP_MULT: f64 = 1.0 - DUMP_SLIPPAGE_ASSUMED;
 
@@ -179,6 +181,7 @@ fn write_internal_error_row(
     while legs_sorted.len() < 3 {
         legs_sorted.push(Leg {
             leg_index: legs_sorted.len(),
+            market_id: String::new(),
             token_id: String::new(),
             side: Side::Buy,
             limit_price: 0.0,
@@ -222,6 +225,7 @@ fn write_internal_error_row(
     record.push("0".to_string()); // set_ratio
     record.push(fill_share_p25(s.bucket, &cfg.buckets).to_string());
     record.push(DUMP_SLIPPAGE_ASSUMED.to_string());
+    record.push(legs_json(&legs_sorted));
     record.push(notes);
     debug_assert_eq!(record.len(), SHADOW_HEADER.len());
 
@@ -241,7 +245,6 @@ fn settle_one(
     let end_ms = s.signal_ts_ms + window_end_ms;
 
     let fill_share_used = fill_share_p25(s.bucket, &cfg.buckets);
-    let window_stats = store.window_stats(&s.market_id, start_ms, end_ms);
 
     let legs_n = s.legs.len();
 
@@ -249,19 +252,27 @@ fn settle_one(
     let mut legs_sorted = s.legs.clone();
     legs_sorted.sort_by_key(|l| l.leg_index);
 
+    let mut pairs: HashSet<(String, String)> = HashSet::new();
+    for leg in &legs_sorted {
+        if !leg.market_id.trim().is_empty() && !leg.token_id.trim().is_empty() {
+            pairs.insert((leg.market_id.clone(), leg.token_id.clone()));
+        }
+    }
+    let window_stats = store.window_stats_for_pairs(&pairs, start_ms, end_ms);
+
     let mut reasons: Vec<ShadowNoteReason> = s.reasons.clone();
 
-    let mut v_mkt: Vec<f64> = vec![0.0; legs_n.min(3)];
-    let mut q_fill: Vec<f64> = vec![0.0; legs_n.min(3)];
+    let mut v_mkt: Vec<f64> = vec![0.0; legs_n];
+    let mut q_fill: Vec<f64> = vec![0.0; legs_n];
     let mut invalid_limit = false;
 
-    for (i, leg) in legs_sorted.iter().take(3).enumerate() {
+    for (i, leg) in legs_sorted.iter().enumerate() {
         if !leg.limit_price.is_finite() || leg.limit_price <= 0.0 {
             invalid_limit = true;
             continue;
         }
         let v = store.volume_at_or_better_price(
-            &s.market_id,
+            &leg.market_id,
             &leg.token_id,
             start_ms,
             end_ms,
@@ -285,10 +296,11 @@ fn settle_one(
         0.0
     };
 
-    let mut legs: Vec<Leg> = legs_sorted;
-    while legs.len() < 3 {
-        legs.push(Leg {
-            leg_index: legs.len(),
+    let mut legs_out: Vec<Leg> = legs_sorted.iter().take(3).cloned().collect();
+    while legs_out.len() < 3 {
+        legs_out.push(Leg {
+            leg_index: legs_out.len(),
+            market_id: String::new(),
             token_id: String::new(),
             side: Side::Buy,
             limit_price: 0.0,
@@ -297,21 +309,23 @@ fn settle_one(
             best_ask_at_signal: 0.0,
         });
     }
-    while v_mkt.len() < 3 {
-        v_mkt.push(0.0);
+
+    let mut v_mkt_out: Vec<f64> = v_mkt.iter().take(3).copied().collect();
+    let mut q_fill_out: Vec<f64> = q_fill.iter().take(3).copied().collect();
+    while v_mkt_out.len() < 3 {
+        v_mkt_out.push(0.0);
     }
-    while q_fill.len() < 3 {
-        q_fill.push(0.0);
+    while q_fill_out.len() < 3 {
+        q_fill_out.push(0.0);
     }
 
-    let mut q_left: Vec<f64> = vec![0.0; 3];
-    for i in 0..legs_n.min(3) {
+    let mut q_left: Vec<f64> = vec![0.0; legs_n];
+    for i in 0..legs_n {
         q_left[i] = q_fill[i] - q_set;
     }
 
-    let cost_per_set: f64 = legs
+    let cost_per_set: f64 = legs_sorted
         .iter()
-        .take(legs_n.min(3))
         .map(|l| Bps::FEE_POLY.apply_cost(l.limit_price))
         .sum();
     let proceeds_per_set = Bps::FEE_MERGE.apply_proceeds(1.0);
@@ -323,7 +337,7 @@ fn settle_one(
     let mut pnl_left_total = 0.0f64;
     let mut bid_missing_legs: Vec<usize> = Vec::new();
     let mut book_missing_legs: Vec<usize> = Vec::new();
-    for (i, l) in legs.iter().take(legs_n.min(3)).enumerate() {
+    for (i, l) in legs_sorted.iter().enumerate() {
         let bid_missing = !l.best_bid_at_signal.is_finite() || l.best_bid_at_signal <= 0.0;
         if bid_missing {
             bid_missing_legs.push(i);
@@ -350,7 +364,7 @@ fn settle_one(
         0.0
     };
 
-    if legs_n != 2 && legs_n != 3 {
+    if legs_n < 2 {
         reasons.push(ShadowNoteReason::LegsMismatch);
     }
 
@@ -358,9 +372,8 @@ fn settle_one(
         reasons.push(ShadowNoteReason::InvalidQty);
     }
 
-    if legs
+    if legs_sorted
         .iter()
-        .take(legs_n.min(3))
         .any(|l| !l.qty.is_finite() || l.qty <= 0.0)
     {
         reasons.push(ShadowNoteReason::InvalidQty);
@@ -425,7 +438,8 @@ fn settle_one(
     let worst_leg_token_id = if bucket_nan {
         String::new()
     } else {
-        legs.iter()
+        legs_sorted
+            .iter()
             .find(|l| l.leg_index == s.bucket_metrics.worst_leg_index)
             .map(|l| l.token_id.clone())
             .unwrap_or_default()
@@ -458,11 +472,11 @@ fn settle_one(
     record.push(q_set.to_string());
 
     for i in 0..3 {
-        record.push(legs[i].token_id.clone());
-        record.push(legs[i].limit_price.to_string());
-        record.push(legs[i].best_bid_at_signal.to_string());
-        record.push(v_mkt[i].to_string());
-        record.push(q_fill[i].to_string());
+        record.push(legs_out[i].token_id.clone());
+        record.push(legs_out[i].limit_price.to_string());
+        record.push(legs_out[i].best_bid_at_signal.to_string());
+        record.push(v_mkt_out[i].to_string());
+        record.push(q_fill_out[i].to_string());
     }
 
     record.push(cost_set.to_string());
@@ -474,6 +488,7 @@ fn settle_one(
     record.push(set_ratio.to_string());
     record.push(fill_share_used.to_string());
     record.push(DUMP_SLIPPAGE_ASSUMED.to_string());
+    record.push(legs_json(&legs_sorted));
     record.push(notes);
     debug_assert_eq!(record.len(), SHADOW_HEADER.len());
 
@@ -486,6 +501,36 @@ fn settle_one(
     }
 
     Ok(())
+}
+
+#[derive(Serialize)]
+struct ShadowLegJson<'a> {
+    leg_index: usize,
+    market_id: &'a str,
+    token_id: &'a str,
+    side: &'a str,
+    limit_price: f64,
+    qty: f64,
+    best_bid_at_signal: f64,
+    best_ask_at_signal: f64,
+}
+
+fn legs_json(legs: &[Leg]) -> String {
+    let items: Vec<ShadowLegJson<'_>> = legs
+        .iter()
+        .filter(|l| !l.token_id.trim().is_empty())
+        .map(|l| ShadowLegJson {
+            leg_index: l.leg_index,
+            market_id: l.market_id.as_str(),
+            token_id: l.token_id.as_str(),
+            side: l.side.as_str(),
+            limit_price: l.limit_price,
+            qty: l.qty,
+            best_bid_at_signal: l.best_bid_at_signal,
+            best_ask_at_signal: l.best_ask_at_signal,
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
 #[cfg(test)]
@@ -558,6 +603,7 @@ mod tests {
             legs: vec![
                 Leg {
                     leg_index: 0,
+                    market_id: "mkt".to_string(),
                     token_id: "A".to_string(),
                     side: Side::Buy,
                     limit_price: 0.49,
@@ -567,6 +613,7 @@ mod tests {
                 },
                 Leg {
                     leg_index: 1,
+                    market_id: "mkt".to_string(),
                     token_id: "B".to_string(),
                     side: Side::Buy,
                     limit_price: 0.48,
@@ -711,6 +758,7 @@ mod tests {
             legs: vec![
                 Leg {
                     leg_index: 0,
+                    market_id: "mkt".to_string(),
                     token_id: "A".to_string(),
                     side: Side::Buy,
                     limit_price: 0.49,
@@ -720,6 +768,7 @@ mod tests {
                 },
                 Leg {
                     leg_index: 1,
+                    market_id: "mkt".to_string(),
                     token_id: "B".to_string(),
                     side: Side::Buy,
                     limit_price: 0.48,
@@ -840,6 +889,7 @@ mod tests {
             legs: vec![
                 Leg {
                     leg_index: 0,
+                    market_id: "mkt".to_string(),
                     token_id: "A".to_string(),
                     side: Side::Buy,
                     limit_price: 0.49,
@@ -849,6 +899,7 @@ mod tests {
                 },
                 Leg {
                     leg_index: 1,
+                    market_id: "mkt".to_string(),
                     token_id: "B".to_string(),
                     side: Side::Buy,
                     limit_price: 0.48,

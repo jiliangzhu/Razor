@@ -152,6 +152,7 @@ impl TradeStore {
             .sum()
     }
 
+    #[allow(dead_code)]
     pub fn window_stats(&self, market_id: &str, start_ms: u64, end_ms: u64) -> WindowStats {
         if market_id.trim().is_empty() || start_ms > end_ms || self.is_empty() {
             return WindowStats::default();
@@ -188,6 +189,61 @@ impl TradeStore {
 
         // Compute max gap in **timestamp order**, not insertion order, to avoid
         // under-estimating gaps when trades arrive out-of-order.
+        let mut max_gap_ms: u64 = 0;
+        ts_samples.sort_unstable();
+        for pair in ts_samples.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            max_gap_ms = max_gap_ms.max(b.saturating_sub(a));
+        }
+
+        WindowStats {
+            trades_in_window,
+            max_gap_ms,
+            max_trade_size,
+            max_trade_notional,
+        }
+    }
+
+    pub fn window_stats_for_pairs(
+        &self,
+        pairs: &HashSet<(String, String)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> WindowStats {
+        if pairs.is_empty() || start_ms > end_ms || self.is_empty() {
+            return WindowStats::default();
+        }
+
+        let mut trades_in_window: usize = 0;
+        let mut ts_samples: Vec<u64> = Vec::new();
+        let mut max_trade_size: f64 = 0.0;
+        let mut max_trade_notional: f64 = 0.0;
+
+        for t in self.trades.iter() {
+            if !pairs.contains(&(t.market_id.clone(), t.token_id.clone())) {
+                continue;
+            }
+            let ts = effective_ingest_ts_ms(t);
+            if ts < start_ms || ts > end_ms {
+                continue;
+            }
+            trades_in_window += 1;
+            ts_samples.push(ts);
+
+            if t.size.is_finite() && t.size > max_trade_size {
+                max_trade_size = t.size;
+            }
+            let notional = t.price * t.size;
+            if notional.is_finite() && notional > max_trade_notional {
+                max_trade_notional = notional;
+            }
+        }
+
+        if trades_in_window == 0 {
+            return WindowStats::default();
+        }
+
         let mut max_gap_ms: u64 = 0;
         ts_samples.sort_unstable();
         for pair in ts_samples.windows(2) {

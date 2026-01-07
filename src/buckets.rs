@@ -136,6 +136,7 @@ mod tests {
             market_id: "m".to_string(),
             legs: vec![
                 LegSnapshot {
+                    market_id: "m".to_string(),
                     token_id: "a".to_string(),
                     best_bid: 0.4991,
                     best_ask: 0.5,
@@ -145,6 +146,7 @@ mod tests {
                     ts_recv_us: 0,
                 },
                 LegSnapshot {
+                    market_id: "m".to_string(),
                     token_id: "b".to_string(),
                     best_bid: 0.4995,
                     best_ask: 0.5,
@@ -167,6 +169,7 @@ mod tests {
             legs: vec![
                 // worst depth = 600 (>500), spread ~= 18.0 bps (<20)
                 LegSnapshot {
+                    market_id: "m".to_string(),
                     token_id: "a".to_string(),
                     best_bid: 0.4991,
                     best_ask: 0.5,
@@ -176,6 +179,7 @@ mod tests {
                     ts_recv_us: 0,
                 },
                 LegSnapshot {
+                    market_id: "m".to_string(),
                     token_id: "b".to_string(),
                     best_bid: 0.4995,
                     best_ask: 0.5,

@@ -30,6 +30,35 @@ pub struct Config {
     pub sim: SimConfig,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum MarketFilterMode {
+    FeeAndRewards,
+    RewardsOnly,
+    Any,
+}
+
+impl MarketFilterMode {
+    pub fn allows(self, fees_enabled: bool, holding_rewards_enabled: bool) -> bool {
+        match self {
+            MarketFilterMode::FeeAndRewards => fees_enabled && holding_rewards_enabled,
+            MarketFilterMode::RewardsOnly => holding_rewards_enabled,
+            MarketFilterMode::Any => true,
+        }
+    }
+}
+
+pub fn market_filter_mode_from_env() -> MarketFilterMode {
+    match std::env::var("RAZOR_MARKET_FILTER_MODE") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "fee_and_rewards" | "fees_and_rewards" | "strict" => MarketFilterMode::FeeAndRewards,
+            "rewards_only" | "reward_only" => MarketFilterMode::RewardsOnly,
+            "any" | "all" | "none" => MarketFilterMode::Any,
+            _ => MarketFilterMode::FeeAndRewards,
+        },
+        Err(_) => MarketFilterMode::FeeAndRewards,
+    }
+}
+
 impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         // Shadow window sanity.

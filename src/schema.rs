@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Context as _;
 use serde::Serialize;
 
-pub const SCHEMA_VERSION: &str = "1.3.2a";
+pub const SCHEMA_VERSION: &str = "1.4.0";
 
 pub const FILE_TICKS: &str = "ticks.csv";
 pub const FILE_TRADES: &str = "trades.csv";
@@ -35,7 +35,7 @@ pub const TRADES_HEADER: [&str; 8] = [
     "exchange_ts_ms",
 ];
 
-pub const SNAPSHOTS_HEADER: [&str; 15] = [
+pub const SNAPSHOTS_HEADER: [&str; 16] = [
     "ts_ms",
     "market_id",
     "legs_n",
@@ -51,9 +51,10 @@ pub const SNAPSHOTS_HEADER: [&str; 15] = [
     "leg2_best_bid",
     "leg2_best_ask",
     "leg2_depth3_usdc",
+    "legs_json",
 ];
 
-pub const SHADOW_HEADER: [&str; 38] = [
+pub const SHADOW_HEADER: [&str; 39] = [
     "run_id",
     "schema_version",
     "signal_id",
@@ -91,6 +92,7 @@ pub const SHADOW_HEADER: [&str; 38] = [
     "set_ratio",
     "fill_share_p25_used",
     "dump_slippage_assumed",
+    "legs_json",
     "notes",
 ];
 
@@ -150,8 +152,8 @@ pub fn write_schema_version_json(
     files.insert(FILE_RAW_WS_JSONL.to_string(), "v1".to_string());
     files.insert(FILE_TICKS.to_string(), "v1".to_string());
     files.insert(FILE_TRADES.to_string(), "v3".to_string());
-    files.insert(FILE_SNAPSHOTS.to_string(), "v1".to_string());
-    files.insert(FILE_SHADOW_LOG.to_string(), "v5".to_string());
+    files.insert(FILE_SNAPSHOTS.to_string(), "v2".to_string());
+    files.insert(FILE_SHADOW_LOG.to_string(), "v6".to_string());
     files.insert(FILE_REPORT_JSON.to_string(), "v1".to_string());
     files.insert(FILE_REPORT_MD.to_string(), "v1".to_string());
     files.insert(FILE_TRADE_LOG.to_string(), "v1".to_string());

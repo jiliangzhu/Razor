@@ -20,7 +20,7 @@ pub const TICKS_HEADER: [&str; 6] = [
     "ask_depth3_usdc",
 ];
 
-pub const SHADOW_HEADER: [&str; 38] = crate::schema::SHADOW_HEADER;
+pub const SHADOW_HEADER: [&str; 39] = crate::schema::SHADOW_HEADER;
 
 const CSV_FLUSH_EVERY_RECORDS: usize = 200;
 const CSV_FLUSH_EVERY_MS: u64 = 1_000;

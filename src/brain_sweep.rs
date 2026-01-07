@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use serde::Deserialize;
 
 use crate::buckets::{classify_bucket, fill_share_p25};
 use crate::config::Config;
@@ -411,6 +412,7 @@ fn generate_signals(cfg: &Config, run_id: &str, snapshots: &[TimedSnapshot]) -> 
         let strategy = match snap.legs.len() {
             2 => Strategy::Binary,
             3 => Strategy::Triangle,
+            n if n >= 4 => Strategy::Multi,
             _ => continue,
         };
 
@@ -449,6 +451,7 @@ fn generate_signals(cfg: &Config, run_id: &str, snapshots: &[TimedSnapshot]) -> 
             .enumerate()
             .map(|(idx, l)| SignalLeg {
                 leg_index: idx,
+                market_id: l.market_id.clone(),
                 token_id: l.token_id.clone(),
                 side: crate::types::Side::Buy,
                 limit_price: l.best_ask,
@@ -503,29 +506,35 @@ fn read_snapshots_csv(path: &Path) -> anyhow::Result<Vec<TimedSnapshot>> {
         let ts_ms = record.get(0).and_then(parse_u64).context("ts_ms")?;
         let market_id = record.get(1).unwrap_or("").trim().to_string();
         let legs_n = record.get(2).and_then(parse_u64).context("legs_n")? as usize;
-        if !(2..=3).contains(&legs_n) {
+        if legs_n < 2 {
             continue;
         }
 
-        let mut legs: Vec<LegSnapshot> = Vec::with_capacity(legs_n);
-        for i in 0..legs_n {
-            let base = 3 + i * 4;
-            let token_id = record.get(base).unwrap_or("").trim().to_string();
-            if token_id.is_empty() {
-                continue;
+        let legs_json_raw = record.get(15).unwrap_or("").trim();
+        let mut legs = parse_legs_json(legs_json_raw, &market_id, ts_ms).unwrap_or_default();
+        if legs.is_empty() {
+            let mut fallback: Vec<LegSnapshot> = Vec::with_capacity(legs_n.min(3));
+            for i in 0..legs_n.min(3) {
+                let base = 3 + i * 4;
+                let token_id = record.get(base).unwrap_or("").trim().to_string();
+                if token_id.is_empty() {
+                    continue;
+                }
+                let best_bid = record.get(base + 1).and_then(parse_f64).unwrap_or(0.0);
+                let best_ask = record.get(base + 2).and_then(parse_f64).unwrap_or(1.0);
+                let depth3 = record.get(base + 3).and_then(parse_f64).unwrap_or(f64::NAN);
+                fallback.push(LegSnapshot {
+                    market_id: market_id.clone(),
+                    token_id,
+                    best_bid,
+                    best_ask,
+                    best_ask_size_best: 0.0,
+                    best_bid_size_best: 0.0,
+                    ask_depth3_usdc: depth3,
+                    ts_recv_us: ts_ms * 1000,
+                });
             }
-            let best_bid = record.get(base + 1).and_then(parse_f64).unwrap_or(0.0);
-            let best_ask = record.get(base + 2).and_then(parse_f64).unwrap_or(1.0);
-            let depth3 = record.get(base + 3).and_then(parse_f64).unwrap_or(f64::NAN);
-            legs.push(LegSnapshot {
-                token_id,
-                best_bid,
-                best_ask,
-                best_ask_size_best: 0.0,
-                best_bid_size_best: 0.0,
-                ask_depth3_usdc: depth3,
-                ts_recv_us: ts_ms * 1000,
-            });
+            legs = fallback;
         }
         if legs.len() != legs_n {
             continue;
@@ -538,6 +547,51 @@ fn read_snapshots_csv(path: &Path) -> anyhow::Result<Vec<TimedSnapshot>> {
     }
     out.sort_by_key(|s| s.ts_ms);
     Ok(out)
+}
+
+#[derive(Deserialize)]
+struct SnapshotLegJson {
+    leg_index: usize,
+    market_id: String,
+    token_id: String,
+    best_bid: f64,
+    best_ask: f64,
+    depth3_usdc: f64,
+}
+
+fn parse_legs_json(
+    raw: &str,
+    fallback_market_id: &str,
+    ts_ms: u64,
+) -> Option<Vec<LegSnapshot>> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut legs: Vec<SnapshotLegJson> = serde_json::from_str(raw).ok()?;
+    legs.sort_by_key(|l| l.leg_index);
+    let out: Vec<LegSnapshot> = legs
+        .into_iter()
+        .filter(|l| !l.token_id.trim().is_empty())
+        .map(|l| LegSnapshot {
+            market_id: if l.market_id.trim().is_empty() {
+                fallback_market_id.to_string()
+            } else {
+                l.market_id
+            },
+            token_id: l.token_id,
+            best_bid: l.best_bid,
+            best_ask: l.best_ask,
+            best_ask_size_best: 0.0,
+            best_bid_size_best: 0.0,
+            ask_depth3_usdc: l.depth3_usdc,
+            ts_recv_us: ts_ms * 1000,
+        })
+        .collect();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn read_trades_by_key(path: &Path) -> anyhow::Result<HashMap<(String, String), Vec<TradeLite>>> {

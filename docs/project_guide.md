@@ -155,7 +155,7 @@ run_dir 内的关键文件（文件名在 `src/schema.rs` 冻结）：
 ### 5.2 `src/schema.rs`（文件名 + CSV header 冻结）
 
 集中定义：
-- `SCHEMA_VERSION = "1.3.2a"`
+- `SCHEMA_VERSION = "1.4.0"`
 - `FILE_*` 常量（run_dir 内文件名）
 - `TRADES_HEADER` / `SNAPSHOTS_HEADER` / `SHADOW_HEADER`（严格冻结）
 
@@ -297,7 +297,7 @@ header（见 `src/recorder.rs` 的 `TICKS_HEADER`）：
 
 ### 6.3 `snapshots.csv`
 按 market 汇总的快照采样（默认 1s，`run.snapshot_log_interval_ms`）：
-- 每行包含 market_id、legs_n、每腿 token_id/bid/ask/depth3
+- 每行包含 market_id、legs_n、前 3 腿 token_id/bid/ask/depth3、以及全量 `legs_json`
 
 用途：离线回放（`razor_replay`）、market_select probe 指标来源。
 
@@ -313,7 +313,7 @@ header（`src/schema.rs::TRADES_HEADER`）：
 ### 6.5 `shadow_log.csv`
 **一行一个 signal 的完整会计分录**（header 冻结见 `src/schema.rs::SHADOW_HEADER`）：
 - signal 元信息：run_id/schema_version/signal_id/signal_ts/window/market/strategy/bucket/worst_leg_token_id
-- 请求与填充：q_req/legs_n/q_set + 每腿 token_id/p_limit/best_bid/v_mkt/q_fill
+- 请求与填充：q_req/legs_n/q_set + 前 3 腿 token_id/p_limit/best_bid/v_mkt/q_fill + 全量 `legs_json`
 - 会计：cost_set/proceeds_set/pnl_set/pnl_left_total/total_pnl
 - 风险指标：q_fill_avg/set_ratio
 - 参数落地：fill_share_p25_used/dump_slippage_assumed

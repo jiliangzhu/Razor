@@ -7,6 +7,7 @@ use tracing::warn;
 use crate::recorder::CsvAppender;
 use crate::schema::SNAPSHOTS_HEADER;
 use crate::types::{now_ms, MarketSnapshot};
+use serde::Serialize;
 
 pub async fn run_snapshot_logger(
     out_path: PathBuf,
@@ -56,7 +57,7 @@ pub async fn run_snapshot_logger(
             continue;
         }
 
-        let mut cols: [String; 15] = Default::default();
+        let mut cols: [String; 16] = Default::default();
         cols[0] = ts_ms.to_string();
         cols[1] = snap.market_id.clone();
         cols[2] = legs_n.to_string();
@@ -68,6 +69,7 @@ pub async fn run_snapshot_logger(
             cols[base + 2] = fmt_f64(leg.best_ask);
             cols[base + 3] = fmt_f64(leg.ask_depth3_usdc);
         }
+        cols[15] = legs_json(&snap);
 
         out.write_record(cols)
             .with_context(|| format!("write snapshot row {}", out_path.display()))?;
@@ -84,6 +86,33 @@ fn fmt_f64(v: f64) -> String {
     format!("{v:.6}")
 }
 
+#[derive(Serialize)]
+struct SnapshotLegJson<'a> {
+    leg_index: usize,
+    market_id: &'a str,
+    token_id: &'a str,
+    best_bid: f64,
+    best_ask: f64,
+    depth3_usdc: f64,
+}
+
+fn legs_json(snap: &MarketSnapshot) -> String {
+    let legs: Vec<SnapshotLegJson<'_>> = snap
+        .legs
+        .iter()
+        .enumerate()
+        .map(|(idx, leg)| SnapshotLegJson {
+            leg_index: idx,
+            market_id: leg.market_id.as_str(),
+            token_id: leg.token_id.as_str(),
+            best_bid: leg.best_bid,
+            best_ask: leg.best_ask,
+            depth3_usdc: leg.ask_depth3_usdc,
+        })
+        .collect();
+    serde_json::to_string(&legs).unwrap_or_else(|_| "[]".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,7 +120,7 @@ mod tests {
 
     #[test]
     fn snapshots_header_is_frozen() {
-        assert_eq!(SNAPSHOTS_HEADER.join(","), "ts_ms,market_id,legs_n,leg0_token_id,leg0_best_bid,leg0_best_ask,leg0_depth3_usdc,leg1_token_id,leg1_best_bid,leg1_best_ask,leg1_depth3_usdc,leg2_token_id,leg2_best_bid,leg2_best_ask,leg2_depth3_usdc");
+        assert_eq!(SNAPSHOTS_HEADER.join(","), "ts_ms,market_id,legs_n,leg0_token_id,leg0_best_bid,leg0_best_ask,leg0_depth3_usdc,leg1_token_id,leg1_best_bid,leg1_best_ask,leg1_depth3_usdc,leg2_token_id,leg2_best_bid,leg2_best_ask,leg2_depth3_usdc,legs_json");
     }
 
     #[test]
@@ -100,6 +129,7 @@ mod tests {
             market_id: "m1".to_string(),
             legs: vec![
                 LegSnapshot {
+                    market_id: "m1".to_string(),
                     token_id: "t0".to_string(),
                     best_ask: 0.49,
                     best_bid: 0.48,
@@ -109,6 +139,7 @@ mod tests {
                     ts_recv_us: 1_700_000_000_000_000,
                 },
                 LegSnapshot {
+                    market_id: "m1".to_string(),
                     token_id: "t1".to_string(),
                     best_ask: 0.51,
                     best_bid: 0.50,
@@ -121,7 +152,7 @@ mod tests {
         };
 
         let ts_ms = snap.legs.iter().map(|l| l.ts_recv_us / 1000).max().unwrap();
-        let mut cols: [String; 15] = Default::default();
+        let mut cols: [String; 16] = Default::default();
         cols[0] = ts_ms.to_string();
         cols[1] = snap.market_id.clone();
         cols[2] = snap.legs.len().to_string();
@@ -132,6 +163,7 @@ mod tests {
             cols[base + 2] = fmt_f64(leg.best_ask);
             cols[base + 3] = fmt_f64(leg.ask_depth3_usdc);
         }
-        assert_eq!(cols.len(), 15);
+        cols[15] = legs_json(&snap);
+        assert_eq!(cols.len(), 16);
     }
 }

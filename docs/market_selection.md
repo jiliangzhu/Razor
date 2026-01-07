@@ -1,4 +1,4 @@
-# Market Selection (Phase 1) — Frozen Spec v1 (v1.3.2a)
+# Market Selection (Phase 1) — Frozen Spec v1 (v1.4.0)
 
 目标：在 Phase 1（dry-run / shadow）只选 **2 个 market**（1×Liquid 主样本 + 1×Thin 压力样本），用最小流量把 **统计口径 + 会计闭环 + reason 归因** 做扎实，避免“跑很多市场但结论不可审计”。
 
@@ -35,7 +35,8 @@
 - Endpoint：`GET {gamma_base}/markets?active=true&closed=false&limit=<N>`
 - 过滤规则（硬过滤）：
   - `clobTokenIds` 可解析为数组
-  - 只保留 `legs_n ∈ {2,3}`（Binary / Triangle）
+  - 只保留 `legs_n >= 2`（Binary / Triangle / Multi）
+  - `feesEnabled == true` 且 `holdingRewardsEnabled == true`
   - `conditionId` 非空
 - 排序（确定性）：按 `volume24hr` 降序（若字段缺失则当作 0）
 
@@ -66,9 +67,14 @@
 
 - `gamma_id`：Gamma market id（写入 config）
 - `condition_id`：WS / trades market_id
-- `legs_n`：腿数（2/3）
-- `strategy`：`binary|triangle`
+- `legs_n`：腿数（>=2）
+- `strategy`：`binary|triangle|multi`
 - `token0_id/token1_id/token2_id`：不足 3 腿则留空
+- `event_id`：Gamma events[0].id（用于 neg-risk 分组）
+- `neg_risk_market_id`：Gamma events[0].negRiskMarketID（为空表示非 neg-risk 事件）
+- `fees_enabled`：Gamma `feesEnabled`
+- `holding_rewards_enabled`：Gamma `holdingRewardsEnabled`
+- `legs_json`：完整腿列表（token_id + outcome）
 - `gamma_volume24hr`：Gamma `volume24hr`（f64）
 - `gamma_liquidity`：Gamma `liquidity`（f64）
 - （可选）`question`：Gamma `question`（仅展示；CSV 需正确 quoting）
@@ -172,7 +178,7 @@ Trades 完整性/连续性强校验（必须落盘到 `recommendation.json`，�
 实现工具必须输出 `market_scores.csv`，header 必须严格一致：
 
 ```
-run_id,probe_start_unix_ms,probe_end_unix_ms,probe_seconds,gamma_id,condition_id,legs_n,strategy,token0_id,token1_id,token2_id,gamma_volume24hr,gamma_liquidity,snapshots_total,one_sided_book_rate,bucket_nan_rate,depth3_degraded_rate,liquid_bucket_rate,thin_bucket_rate,worst_spread_bps_p50,worst_depth3_usdc_p50,trades_total,trades_per_min,trade_poll_hit_limit_count,trades_duplicated_count,snapshots_eval_total,passes_min_net_edge_count,passes_min_net_edge_per_hour,expected_net_bps_p50,expected_net_bps_p90,expected_net_bps_max
+run_id,probe_start_unix_ms,probe_end_unix_ms,probe_seconds,gamma_id,condition_id,legs_n,strategy,token0_id,token1_id,token2_id,gamma_volume24hr,gamma_liquidity,snapshots_total,one_sided_book_rate,bucket_nan_rate,depth3_degraded_rate,liquid_bucket_rate,thin_bucket_rate,worst_spread_bps_p50,worst_depth3_usdc_p50,trades_total,trades_per_min,trade_poll_hit_limit_count,trades_duplicated_count,snapshots_eval_total,passes_min_net_edge_count,passes_min_net_edge_per_hour,expected_net_bps_p50,expected_net_bps_p90,expected_net_bps_max,event_id,neg_risk_market_id,fees_enabled,holding_rewards_enabled,legs_json
 ```
 
 字段格式冻结：
@@ -181,6 +187,7 @@ run_id,probe_start_unix_ms,probe_end_unix_ms,probe_seconds,gamma_id,condition_id
 - `*_bps_*` 一律输出整数 bps（`i32` 的十进制字符串）
 - `*_usdc_*` 为 `f64`
 - `token2_id` 对 binary 为空字符串
+- `legs_json` 保存全量腿（`token_id/outcome`），用于 >3 腿场景
 
 ---
 
@@ -192,7 +199,7 @@ run_id,probe_start_unix_ms,probe_end_unix_ms,probe_seconds,gamma_id,condition_id
 
 候选 market 必须满足：
 
-- `legs_n ∈ {2,3}`
+- `legs_n >= 2`
 - `snapshots_total >= 300`（30 分钟内平均每 6 秒至少 1 个 snapshot；可后续实现为 CLI 可配，但默认冻结）
 - `trades_total >= 10`（避免死市场）
 - `bucket_nan_rate <= 0.20`（否则 bucket 对照不可用）
@@ -235,7 +242,9 @@ run_id,probe_start_unix_ms,probe_end_unix_ms,probe_seconds,gamma_id,condition_id
 ### 6.5 互斥规则
 
 - Thin market 不能与 Liquid market 相同。
-- 若要求“控制变量”，可启用 `prefer_strategy=binary|triangle`：两者必须同 strategy，否则拒绝并提示重新跑候选池。
+- 若要求“控制变量”，可启用 `prefer_strategy=binary|triangle|multi|neg_risk`：
+  - `binary/triangle/multi`：两者必须同 strategy
+  - `neg_risk`：仅保留具备 `neg_risk_market_id` 的市场
 
 ### 6.6 产物（冻结）
 

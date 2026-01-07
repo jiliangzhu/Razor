@@ -12,7 +12,7 @@ pub const FILE_MARKET_SCORES: &str = "market_scores.csv";
 pub const FILE_RECOMMENDATION_JSON: &str = "recommendation.json";
 pub const FILE_SUGGEST_TOML: &str = "suggest.toml";
 
-pub const MARKET_SCORES_HEADER: [&str; 31] = [
+pub const MARKET_SCORES_HEADER: [&str; 36] = [
     "run_id",
     "probe_start_unix_ms",
     "probe_end_unix_ms",
@@ -44,6 +44,11 @@ pub const MARKET_SCORES_HEADER: [&str; 31] = [
     "expected_net_bps_p50",
     "expected_net_bps_p90",
     "expected_net_bps_max",
+    "event_id",
+    "neg_risk_market_id",
+    "fees_enabled",
+    "holding_rewards_enabled",
+    "legs_json",
 ];
 
 pub fn write_market_scores_csv(
@@ -227,7 +232,7 @@ pub fn write_recommendation_json(
     Ok(())
 }
 
-pub(super) fn row_to_record(row: &MarketScoreRow) -> [String; 31] {
+pub(super) fn row_to_record(row: &MarketScoreRow) -> [String; 36] {
     [
         row.run_id.clone(),
         row.probe_start_unix_ms.to_string(),
@@ -260,6 +265,11 @@ pub(super) fn row_to_record(row: &MarketScoreRow) -> [String; 31] {
         row.expected_net_bps_p50.to_string(),
         row.expected_net_bps_p90.to_string(),
         row.expected_net_bps_max.to_string(),
+        row.event_id.clone(),
+        row.neg_risk_market_id.clone(),
+        row.fees_enabled.to_string(),
+        row.holding_rewards_enabled.to_string(),
+        row.legs_json.clone(),
     ]
 }
 
@@ -450,7 +460,7 @@ mod tests {
     #[test]
     fn market_scores_header_is_frozen() {
         let header = MARKET_SCORES_HEADER.join(",");
-        assert_eq!(header, "run_id,probe_start_unix_ms,probe_end_unix_ms,probe_seconds,gamma_id,condition_id,legs_n,strategy,token0_id,token1_id,token2_id,gamma_volume24hr,gamma_liquidity,snapshots_total,one_sided_book_rate,bucket_nan_rate,depth3_degraded_rate,liquid_bucket_rate,thin_bucket_rate,worst_spread_bps_p50,worst_depth3_usdc_p50,trades_total,trades_per_min,trade_poll_hit_limit_count,trades_duplicated_count,snapshots_eval_total,passes_min_net_edge_count,passes_min_net_edge_per_hour,expected_net_bps_p50,expected_net_bps_p90,expected_net_bps_max");
+        assert_eq!(header, "run_id,probe_start_unix_ms,probe_end_unix_ms,probe_seconds,gamma_id,condition_id,legs_n,strategy,token0_id,token1_id,token2_id,gamma_volume24hr,gamma_liquidity,snapshots_total,one_sided_book_rate,bucket_nan_rate,depth3_degraded_rate,liquid_bucket_rate,thin_bucket_rate,worst_spread_bps_p50,worst_depth3_usdc_p50,trades_total,trades_per_min,trade_poll_hit_limit_count,trades_duplicated_count,snapshots_eval_total,passes_min_net_edge_count,passes_min_net_edge_per_hour,expected_net_bps_p50,expected_net_bps_p90,expected_net_bps_max,event_id,neg_risk_market_id,fees_enabled,holding_rewards_enabled,legs_json");
     }
 
     #[test]

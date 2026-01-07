@@ -69,6 +69,8 @@ pub struct ByBucket {
 pub struct ByStrategy {
     pub binary: BucketStats,
     pub triangle: BucketStats,
+    pub multi: BucketStats,
+    pub neg_risk: BucketStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +193,8 @@ pub fn compute_report(
     let mut acc_bucket_thin = Accum::default();
     let mut acc_strategy_binary = Accum::default();
     let mut acc_strategy_triangle = Accum::default();
+    let mut acc_strategy_multi = Accum::default();
+    let mut acc_strategy_neg_risk = Accum::default();
 
     let mut worst: Vec<WorstEntry> = Vec::new();
 
@@ -229,6 +233,8 @@ pub fn compute_report(
                 let strategy = match r.strategy.as_str() {
                     "binary" => "binary",
                     "triangle" => "triangle",
+                    "multi" => "multi",
+                    "neg_risk" => "neg_risk",
                     _ => {
                         rows_bad += 1;
                         continue;
@@ -253,6 +259,8 @@ pub fn compute_report(
                 match strategy {
                     "binary" => acc_strategy_binary.push(r.total_pnl, r.set_ratio),
                     "triangle" => acc_strategy_triangle.push(r.total_pnl, r.set_ratio),
+                    "multi" => acc_strategy_multi.push(r.total_pnl, r.set_ratio),
+                    "neg_risk" => acc_strategy_neg_risk.push(r.total_pnl, r.set_ratio),
                     _ => unreachable!("validated strategy"),
                 }
 
@@ -317,6 +325,8 @@ pub fn compute_report(
         by_strategy: ByStrategy {
             binary: acc_strategy_binary.finish(),
             triangle: acc_strategy_triangle.finish(),
+            multi: acc_strategy_multi.finish(),
+            neg_risk: acc_strategy_neg_risk.finish(),
         },
         worst_20: worst,
         verdict: Verdict {
@@ -472,10 +482,22 @@ fn render_report_md(report: &Report) -> String {
         report.by_strategy.binary.avg_set_ratio
     ));
     out.push_str(&format!(
-        "| triangle | {} | {:.6} | {:.6} |\n\n",
+        "| triangle | {} | {:.6} | {:.6} |\n",
         report.by_strategy.triangle.signals,
         report.by_strategy.triangle.pnl,
         report.by_strategy.triangle.avg_set_ratio
+    ));
+    out.push_str(&format!(
+        "| multi | {} | {:.6} | {:.6} |\n",
+        report.by_strategy.multi.signals,
+        report.by_strategy.multi.pnl,
+        report.by_strategy.multi.avg_set_ratio
+    ));
+    out.push_str(&format!(
+        "| neg_risk | {} | {:.6} | {:.6} |\n\n",
+        report.by_strategy.neg_risk.signals,
+        report.by_strategy.neg_risk.pnl,
+        report.by_strategy.neg_risk.avg_set_ratio
     ));
 
     out.push_str("## Worst 20\n\n");
